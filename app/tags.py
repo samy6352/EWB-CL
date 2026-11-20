@@ -1,0 +1,787 @@
+"""Cost grouped by the tags on the resources that incurred it.
+
+The interesting question is not "what did tag X cost" but "what did the resources carrying
+these tags cost, together" — and that is a set question, asked repeatedly as someone adds and
+removes tags. Answering it server-side would mean a round trip per click.
+
+So the server answers once, with the pieces the client needs to answer every later question
+itself: each resource, its cost, and which tag keys it carries. Selecting a tag is then an
+intersection over a few thousand small objects, which is instant and stays instant offline.
+
+Two things worth knowing about Azure tag data:
+
+  * Tags arrive as a JSON object per cost row, e.g. {"Environment":"prod","Owner":"ana"}. A
+    resource appears on many rows, so cost has to be summed per resource before anything is
+    counted, or a resource billed daily looks thirty times more expensive than one billed once.
+
+  * Tag keys are not case-normalised by Azure: `Environment`, `environment` and `ENVIRONMENT`
+    are three distinct keys on three resources, and treating them as one would silently merge
+    what a governance report needs to keep apart. They are kept separate, and the UI shows them
+    as they are.
+
+  * **A tag only reaches cost data by riding on a usage record.** Tagging a resource does not
+    backfill the usage it has already emitted, and a resource emitting no usage — a deallocated
+    VM, a free tier, anything stopped — carries its tags nowhere. So a tag can be correct, live
+    on the resource, and completely absent from cost. Showing only what cost data knows means
+    someone who tagged something an hour ago sees nothing and concludes the feature is broken.
+    `live_tag_keys` exists to close that gap: it asks Azure what tags actually exist so the tab
+    can say "this tag is real, it just has no spend behind it in this window" rather than
+    staying silent.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from collections.abc import Iterable
+from contextlib import nullcontext
+from typing import Any, Literal, overload
+
+log = logging.getLogger("cloudlens.tags")
+
+# Enough to cover a large estate, small enough to stay comfortably inside a JSON response and
+# a browser's memory. Beyond this the response says it is partial rather than quietly trimming.
+MAX_RESOURCES = 8000
+
+# Candidates read from the stored rankings beyond the rows returned, so a resource whose raw
+# spellings merge into one ranked identity cannot fall just outside them.
+CANDIDATE_MARGIN = 1000
+
+# Per-resource-per-day cells. A large estate over 90 days can reach seven figures, which is a
+# response nobody wants to parse and a browser tab nobody wants to scroll. Past this the daily
+# detail is dropped and the response says so, so the chart can fall back to estate-wide totals
+# rather than drawing a series built from a silently truncated half of the data.
+MAX_DAILY_CELLS = 200_000
+
+# Tag keys currently on resources, whatever they cost. Counts resources, not usage rows.
+LIVE_KEYS_QUERY = """
+    Resources
+    | where isnotnull(tags) and array_length(bag_keys(tags)) > 0
+    | mv-expand kv = tags
+    | extend k = tostring(bag_keys(kv)[0])
+    | where isnotempty(k)
+    | summarize n = count() by k
+    | order by n desc
+"""
+
+# Tags Azure writes for itself, which no one chose and no one can act on.
+#
+# They matter because the tab ranks keys by the spend carrying them, and these ride on
+# *everything*: `aks-managed-*` is stamped on every node-pool disk, NIC and public IP in
+# a cluster, `hidden-*` on whole classes of platform resource. A real business key like
+# `CostCentre` applied to 60% of an estate loses the top of the list to a key the
+# platform applied to 100% of one noisy service, and the governance answer underneath
+# ("what are we failing to attribute") is buried below four rows nobody can change.
+#
+# They are flagged rather than dropped. Someone auditing an AKS estate has a legitimate
+# reason to look at them, and silently removing keys from a coverage report is how a
+# tool starts disagreeing with the portal for reasons the reader cannot see.
+PLATFORM_TAG_PREFIXES = (
+    "aks-managed-",
+    "k8s-azure-",
+    "kubernetes.io-",
+    "kubernetes.io/",
+    "hidden-",
+)
+
+# Values Azure generates rather than a person choosing them. A key whose values are all
+# timestamps or GUIDs is machine bookkeeping however it is spelled, so the prefix list
+# above does not have to be exhaustive to catch the same class of noise.
+_MACHINE_VALUE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}|$)"
+    r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$)",
+    re.IGNORECASE,
+)
+
+
+def is_platform_key(key: str, values: Iterable[str] = ()) -> bool:
+    """Whether a tag key is Azure's own bookkeeping rather than someone's decision."""
+    lowered = str(key or "").strip().lower()
+    if not lowered:
+        return False
+    if any(lowered.startswith(prefix) for prefix in PLATFORM_TAG_PREFIXES):
+        return True
+    sample = [v for v in values if v]
+    return bool(sample) and all(_MACHINE_VALUE.match(v) for v in sample)
+
+
+async def live_tag_keys(scope: list[str] | None = None) -> list[dict[str, Any]]:
+    """Tag keys that exist on resources right now, from Resource Graph.
+
+    Fails soft. This is a supplement to a warehouse answer that is already complete on its own
+    terms, so an ARM hiccup, a throttle or a missing permission should cost the caller the
+    extra context and nothing else — never the tab.
+
+    `None` means "everything the server can see", matching the convention the rest of the app
+    uses. An explicitly empty list means the opposite — nothing is in scope — and must not
+    widen to the whole estate, which is what `scope or <all>` alone would do.
+    """
+    try:
+        return await read_live_tag_keys(scope)
+    except Exception as exc:  # noqa: BLE001 - context is optional, the tab is not
+        log.info("live tag keys unavailable, continuing without them: %s", str(exc)[:200])
+        return []
+
+
+async def read_live_tag_keys(scope: list[str] | None = None) -> list[dict[str, Any]]:
+    """Read optional live evidence without disguising a failed lookup as an empty estate."""
+    from .cost import list_subscriptions
+    from .waste import _arg
+
+    if scope is not None and not scope:
+        return []
+    subs = scope if scope is not None else [
+        s["id"] for s in (await list_subscriptions())["subscriptions"]]
+    if not subs:
+        return []
+    rows = await _arg(LIVE_KEYS_QUERY, subs, top=500)
+    out = []
+    for row in rows:
+        key = str(row.get("k") or "").strip()
+        if key:
+            out.append({"key": key, "resources": int(row.get("n") or 0)})
+    return out
+
+
+def merge_live_keys(payload: dict[str, Any], live: list[dict[str, Any]]) -> dict[str, Any]:
+    """Add the keys Azure knows about that cost data has never seen.
+
+    Kept separate from `keys` rather than merged into it. They are not comparable: every entry
+    in `keys` has a cost behind it, and these have none, so folding them together would put
+    zero-cost rows in a list someone reads as a spend breakdown.
+    """
+    if not live:
+        return payload
+
+    costed = {k["key"] for k in payload.get("keys", [])}
+    payload["uncosted"] = [{**k, "platform": is_platform_key(k["key"])}
+                           for k in live if k["key"] not in costed]
+    payload["live_keys"] = len(live)
+    return payload
+
+
+
+def _ranked_candidates(r: Any, hi: Any, days: int, code: str | None
+                       ) -> tuple[list[str], float | None] | None:
+    """Highest-ranked raw ResourceIds plus every grouping exception, or None.
+
+    The full ranking of two million resources, to publish the top 8,000, was 20 of this tab's
+    34 seconds. `resource_ranks` already holds every resource's cost per rolling window, in
+    order, so the answer's candidates are a range read. The caller still computes every figure
+    itself, over only these ids -- this chooses *which* resources, never what they cost.
+
+    None means "use the full query": a calendar month or a window the rankings do not hold, a
+    converted or filtered reader, a stale ranking, or fewer rankings than needed. The second
+    value is the lowest cost among the candidates, which the caller uses to prove nothing
+    outside them could have made the answer, or None when every ranked resource is included.
+    """
+    import datetime as dt
+
+    from . import reporting, resource_ranks
+
+    if (reporting.month_bounds() or getattr(r, "narrowed", False)
+            or not getattr(r, "ranks", None) or days not in resource_ranks.ROLLING):
+        return None
+    newest = dt.date.fromisoformat(str(hi)[:10])
+    lo, mid, top = resource_ranks.window_dates(newest, days)
+    # The window the caller aggregates is (newest - days, newest], which is the ranking's
+    # "current" half; anything else would rank a different set of days.
+    if top != newest or mid != newest - dt.timedelta(days=days):
+        return None
+    stored = resource_ranks.stored_period(r, lo, mid, top)
+    if stored is None:
+        return None
+
+    skeys = resource_ranks.scope_keys(r) if getattr(r, "scoped", False) else None
+    where, params = ["period = ?"], [stored]
+    if code is not None:
+        # Rankings hold the currency upper-cased, with blank and UNKNOWN as "unknown".
+        norm = code.strip().upper()
+        where.append("currency = ?")
+        params.append("unknown" if norm in ("", "UNKNOWN") else norm)
+    if skeys is not None:
+        where.append("skey = ANY(?)")
+        params.append(skeys)
+    wanted = MAX_RESOURCES + 1 + CANDIDATE_MARGIN
+    ranked = r.rows(
+        f"SELECT rkey, cost FROM {resource_ranks.TABLE} WHERE {' AND '.join(where)} "
+        "ORDER BY rnk LIMIT ?", limit=None, params=[*params, wanted])
+    if not ranked:
+        return None
+    raw = [row["raw"] for row in r.rows(
+        f"SELECT raw FROM {resource_ranks.RAW} WHERE rkey = ANY(?)", limit=None,
+        params=[[row["rkey"] for row in ranked]])]
+    # A ranking identity may split into several raw groups (including currency
+    # spellings), or a raw id may merge ranks from several subscriptions. Signed
+    # costs then invalidate the simple cutoff bound. Include every such exception,
+    # regardless of rank; only one-to-one identities remain outside the candidates.
+    available = r.rows("SELECT to_regclass(?) AS relation", limit=1,
+                       params=[resource_ranks.TAG_EXCEPTIONS])
+    exceptions = r.rows(
+        f"SELECT raw FROM {resource_ranks.TAG_EXCEPTIONS}" if available[0]["relation"] else
+        resource_ranks.tag_exceptions_sql(resource_ranks.RAW), limit=None)
+    raw = list(dict.fromkeys([*raw, *(row["raw"] for row in exceptions)]))
+    cutoff = float(ranked[-1]["cost"]) if len(ranked) >= wanted else None
+    return raw, cutoff
+
+
+@overload
+def cost_by_tag(scope: list[str] | None = None, days: int = 30,
+                currency: str | None = None, *, encoded: Literal[False] = False) -> dict[str, Any]: ...
+
+
+@overload
+def cost_by_tag(scope: list[str] | None = None, days: int = 30,
+                currency: str | None = None, *, encoded: Literal[True]) -> dict[str, Any] | str: ...
+
+
+def cost_by_tag(scope: list[str] | None = None, days: int = 30,
+                currency: str | None = None, *, encoded: bool = False) -> dict[str, Any] | str:
+    """Every tagged resource in the window, with its cost, its tag keys and its daily spend."""
+    from . import reporting
+
+    days = reporting.period_days(days)
+    if scope is not None and not scope:
+        return _empty(days)
+    from .warehouse import warehouse
+
+    with warehouse.reader(scope=scope, currency=currency, usage=("tags",)) as r:
+        from . import tab_serving
+
+        served = (tab_serving.read_text(r, "tags", days) if encoded
+                  else tab_serving.read(r, "tags", days))
+        return served if served is not None else _build(r, days, currency)
+
+
+def _build(r: Any, days: int, currency: str | None = None) -> dict[str, Any]:
+    """Exact SQL reductions on one reader, shared with the serving publisher."""
+    from . import reporting, resource_tags
+
+    with nullcontext(r):
+        # Money per resource from the per-resource summary when it can price this
+        # connection, tags looked up for just the resources returned. Scanning `costs`
+        # for both timed out on a 16.9M-row estate: `Tags` is most of every row's bytes.
+        agg = getattr(r, "agg", "costs")
+        tag_source = getattr(r, "tags", None)
+        named = getattr(r, "named", "costs") if tag_source else "costs"
+        # Anchored to the newest data, not to today. Cost lands a day or two late, so a window
+        # ending at CURRENT_DATE quietly drops the most recent complete day -- and on a
+        # warehouse that has not been refreshed this week it returns almost nothing, which
+        # reads as "you have no tagged resources" rather than "this data is stale".
+        edge = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {agg}')
+        hi = edge[0]["hi"] if edge and edge[0]["hi"] else None
+        if hi is None:
+            return _empty(days)
+
+        start = reporting.start_sql(hi, days)
+        window = f'"ChargePeriodStart" > {start}'
+        totals = r.rows(
+            'SELECT COALESCE(NULLIF("BillingCurrency", \'\'), \'unknown\') AS currency, '
+            'SUM(COALESCE("BilledCost", 0)) AS cost '
+            f'FROM {agg} WHERE {window} GROUP BY 1',
+            limit=MAX_RESOURCES + 1,
+        )
+        display_currency = currency
+        currency, mixed = _dominant(totals)
+        display_window = window
+        if mixed:
+            # Select the displayed currency before fetching bounded resource/day detail.
+            display_window += " AND " + _currency_predicate(currency)
+
+        # Over MAX_DAILY_CELLS the per-resource daily detail is dropped below, so it is only
+        # computed when it can be kept. Every resource active in the window owns at least one
+        # cell, so a resource count over the cap proves the answer is "dropped" without building
+        # 2.7M cells to find out -- measured 50.7 s of the tab's 77 s on the 16.9M-row estate.
+        over_cap = _daily_cells_exceed_cap(r, named, display_window, start,
+                                           currency if mixed else None)
+        daily: list[dict[str, Any]] | None = None
+
+        identity = """
+              COALESCE(NULLIF("ResourceId", ''), "ResourceName", '(unnamed)') AS id,
+              MAX(COALESCE(NULLIF("ResourceName", ''), '(unnamed)'))          AS name,
+              MAX(COALESCE("ServiceName", ''))                                AS service,"""
+        grouped = """
+              MAX(COALESCE("ResourceGroup", ''))                              AS resource_group,
+              COALESCE(NULLIF("BillingCurrency", ''), 'unknown')              AS currency,
+              SUM(COALESCE("BilledCost", 0))                                  AS cost,
+              CASE WHEN COUNT(DISTINCT COALESCE("SubAccountId", '')) = 1
+                   THEN MAX(NULLIF("SubAccountId", '')) END                   AS subscription_id"""
+        if tag_source:
+            # The subscription's display name from the rollup, which holds it per
+            # subscription; the per-resource summary does not carry it.
+            lateral = resource_tags.lateral_sql(tag_source, "top.id", "top.currency", start, str(hi)[:10])
+            rows = None
+            candidates = None
+            if not display_currency and named == "resource_presence":
+                try:
+                    with getattr(r, "transaction", nullcontext)():
+                        candidates = _ranked_candidates(r, hi, days, currency if mixed else None)
+                except Exception as exc:  # noqa: BLE001 - the full query still answers
+                    log.warning("cost_by_tag: ranked candidates failed (%s); using the full query",
+                                str(exc)[:300])
+            if candidates is not None:
+                raw, cutoff = candidates
+                part = f"""
+                  SELECT {identity}
+                    ARRAY_AGG(DISTINCT "SubAccountId")                        AS name_subs,
+                    {grouped}
+                  FROM {named}
+                  WHERE {display_window} AND %s
+                  GROUP BY 1, 6"""
+                by_id = part % '"ResourceId" = ANY(?)'
+                # Rows the rankings leave out: no ResourceId, or one that is only spaces. They are
+                # grouped by that text or by name, exactly as the full query does.
+                by_name = part % "(\"ResourceId\" IS NULL OR trim(\"ResourceId\") = '')"
+                ranked = r.rows(
+                    f"""
+                    WITH names AS MATERIALIZED (
+                      SELECT "SubAccountId" AS name_sub, MAX("SubAccountName") AS name_text
+                      FROM {agg} WHERE {display_window} GROUP BY 1
+                    ), part AS (
+                      {by_id}
+                      UNION ALL
+                      {by_name}
+                    ), top AS (
+                      SELECT * FROM part ORDER BY cost DESC, id, currency LIMIT {MAX_RESOURCES + 1}
+                    )
+                    SELECT top.id, top.name, top.service,
+                           COALESCE(nm.subscription, '') AS subscription,
+                           top.resource_group, top.currency, top.cost, top.subscription_id,
+                           tg.tags, NOT tg.unknown AS tags_available FROM top
+                    LEFT JOIN LATERAL (
+                      SELECT MAX(name_text) AS subscription FROM names
+                      WHERE name_sub = ANY(top.name_subs)
+                    ) nm ON TRUE
+                    {lateral}
+                    ORDER BY cost DESC, id, currency
+                    """,
+                    limit=MAX_RESOURCES + 1, params=[raw],
+                )
+                # Accepted only when nothing left out of the candidates could have ranked inside
+                # the answer: every split/merged identity was explicitly included, so
+                # each omitted raw group's cost equals its own ranking's cost.
+                # `cutoff` None means every ranked resource was a candidate.
+                if cutoff is None or (len(ranked) > MAX_RESOURCES
+                                      and float(ranked[MAX_RESOURCES]["cost"]) > cutoff):
+                    rows = ranked
+                else:
+                    log.info("cost_by_tag: ranked candidates cannot prove the top %d; "
+                             "using the full query", MAX_RESOURCES)
+            if rows is None and not over_cap:
+                rows, daily = _resources_and_cells(r, agg, named, display_window, lateral)
+            if rows is None:
+                rows = r.rows(
+                    f"""
+                    WITH names AS (
+                      SELECT "SubAccountId" AS name_sub, MAX("SubAccountName") AS name_text
+                      FROM {agg} WHERE {display_window} GROUP BY 1
+                    ), top AS (
+                      SELECT {identity}
+                        MAX(COALESCE(name_text, ''))                              AS subscription,
+                        {grouped}
+                      FROM {named} LEFT JOIN names ON name_sub = "SubAccountId"
+                      WHERE {display_window}
+                      GROUP BY 1, 6
+                      ORDER BY cost DESC, id, currency
+                      LIMIT {MAX_RESOURCES + 1}
+                    )
+                    SELECT top.*, tg.tags, NOT tg.unknown AS tags_available FROM top
+                    {lateral}
+                    ORDER BY cost DESC, id, currency
+                    """,
+                    limit=MAX_RESOURCES + 1,
+                )
+        else:
+            rows = r.rows(
+                f"""
+                SELECT {identity}
+                  MAX(COALESCE("SubAccountName", ''))                         AS subscription,
+                  {grouped},
+                  MAX(CASE WHEN TRIM(COALESCE("Tags", '')) NOT IN ('', '{{}}', '[]', 'null')
+                           THEN "Tags" END)                                   AS tags,
+                  BOOL_AND("Tags" IS NOT NULL AND
+                           (COALESCE("BillingCostBasis" = 'FOCUS', FALSE) OR
+                            TRIM("Tags") NOT IN ('', 'null')))                AS tags_available
+                FROM costs
+                WHERE {display_window}
+                GROUP BY 1, 6
+                ORDER BY cost DESC, id, currency
+                """,
+                limit=MAX_RESOURCES + 1,
+            )
+
+        # Per resource per day. Needed for both the trend and the day drill-down, and both are
+        # driven entirely client-side: the whole point of the tab is that changing the tag
+        # selection re-answers instantly, and a daily series fetched per selection would put a
+        # round trip behind every click.
+        if over_cap:
+            daily = []
+        elif daily is None:
+            daily = r.rows(
+                f"""
+                SELECT
+                  COALESCE(NULLIF("ResourceId", ''), "ResourceName", '(unnamed)') AS id,
+                  "ChargePeriodStart"                                             AS day,
+                  COALESCE(NULLIF("BillingCurrency", ''), 'unknown')              AS currency,
+                  SUM(COALESCE("BilledCost", 0))                                  AS cost
+                FROM {named}
+                WHERE {display_window}
+                GROUP BY 1, 2, 3
+                """,
+                limit=MAX_DAILY_CELLS + 1,
+            )
+
+    # Budget amounts are native billing units, never the dashboard's converted currency.
+    # Aggregate per subscription before applying a row cap so a mixed unit cannot look single.
+    with nullcontext(r):
+        native = r.rows(
+            f"""SELECT subscription_id,
+                       STRING_AGG(DISTINCT COALESCE(NULLIF(UPPER(TRIM(currency)), ''), 'unknown'), ',')
+                         AS currencies
+                FROM (
+                  SELECT DISTINCT "SubAccountId" AS subscription_id, "BillingCurrency" AS currency
+                  FROM {getattr(r, "native_agg", getattr(r, "agg", "costs"))} WHERE {window}
+                ) native_codes GROUP BY subscription_id """,
+            limit=MAX_RESOURCES + 1,
+        )
+    native_currencies = {
+        str(row["subscription_id"]).lower(): sorted(row["currencies"].split(","))
+        for row in native if row.get("subscription_id")
+    }
+
+    truncated = len(rows) > MAX_RESOURCES
+    if truncated:
+        log.info("cost_by_tag: more than %d resources; response is partial", MAX_RESOURCES)
+        rows = rows[:MAX_RESOURCES]
+
+    rows = [r for r in rows if (r.get("currency") or "unknown") == currency] if mixed else rows
+
+    daily_dropped = over_cap or len(daily) > MAX_DAILY_CELLS
+    if daily_dropped:
+        log.info("cost_by_tag: over %d daily cells; dropping per-resource detail", MAX_DAILY_CELLS)
+        daily = []
+    if mixed:
+        daily = [c for c in daily if (c.get("currency") or "unknown") == currency]
+    if truncated:
+        # The chart and its drill-down describe the same returned subset.
+        retained = {row["id"] for row in rows}
+        daily = [cell for cell in daily if cell["id"] in retained]
+
+    # Dates come from the data, not from a generated range. A day Azure never billed should not
+    # appear as a zero on the chart -- that reads as "we spent nothing", when the truth is that
+    # nothing was recorded. A gap stays a gap.
+    #
+    # Each distinct day is formatted once. `str()` of a date per cell was a fifth of this
+    # function on a 30,000-cell month, for the same few dozen answers.
+    labels: dict[Any, str] = {}
+    for cell in daily:
+        day = cell["day"]
+        if day not in labels:
+            labels[day] = str(day)
+    dates = sorted(set(labels.values()))
+    index = {d: i for i, d in enumerate(dates)}
+
+    per_resource: dict[str, list[list[float]]] = {}
+    daily_total = [0.0] * len(dates)
+    for cell in daily:
+        i = index[labels[cell["day"]]]
+        cost = float(cell.get("cost") or 0.0)
+        per_resource.setdefault(cell["id"], []).append([i, cost])
+        daily_total[i] += cost
+    # In day order. The query does not order its groups, so without this the same data
+    # produced a differently ordered series from one run -- or one source table -- to the next.
+    for series in per_resource.values():
+        series.sort(key=lambda cell: cell[0])
+
+    resources: list[dict[str, Any]] = []
+    key_totals: dict[str, dict[str, Any]] = {}
+    tagged_cost = 0.0
+    tagged_count = 0
+    untagged_cost = 0.0
+    untagged_count = 0
+    unknown_cost = 0.0
+    unknown_count = 0
+    missing_tags = False
+
+    # Values are interned. The same "owner@example.com" or app-insights resource id can
+    # sit on hundreds of resources, and repeating the string each time is most of the response
+    # for none of the information.
+    pool: list[str] = []
+    pool_index: dict[str, int] = {}
+
+    def intern(value: str) -> int:
+        idx = pool_index.get(value)
+        if idx is None:
+            idx = len(pool)
+            pool_index[value] = idx
+            pool.append(value)
+        return idx
+
+    for row in rows:
+        pairs = _pairs(row.get("tags"))
+        keys = [k for k, _ in pairs]
+        cost = float(row.get("cost") or 0.0)
+        available = row.get("tags_available")
+        if available is None:
+            available = bool(str(row.get("tags") or "").strip())
+        if not pairs and str(row.get("tags") or "").strip() not in ("", "{}", "[]", "null"):
+            available = False
+        missing_tags = missing_tags or not available
+        status = "tagged" if keys else "untagged" if available else "unknown"
+
+        # Untagged resources are carried too, with an empty key list.
+        #
+        # They are not filler. The daily chart is estate-wide when no tag is selected, and the
+        # day drill-down reads from this list -- so leaving them out made a bar and the table
+        # underneath it disagree about the same day, with the table quietly the smaller of the
+        # two. A resource with no tags still spent money on the 18th.
+        resources.append({
+            "id": row["id"],
+            "name": row.get("name") or "(unnamed)",
+            "service": row.get("service") or "",
+            "subscription": row.get("subscription") or "",
+            "subscription_id": row.get("subscription_id") or "",
+            "group": row.get("resource_group") or "",
+            # Selection totals must sum unrounded amounts, just like the summary.
+            "cost": cost,
+            "keys": keys,
+            "tag_status": status,
+            # Parallel to `keys`: v[i] indexes the value of keys[i] in `values`.
+            "v": [intern(v) for _, v in pairs],
+            "d": per_resource.get(row["id"], []),
+        })
+
+        if not keys:
+            if status == "untagged":
+                untagged_cost += cost
+                untagged_count += 1
+            else:
+                unknown_cost += cost
+                unknown_count += 1
+            continue
+
+        tagged_cost += cost
+        tagged_count += 1
+        for k, v in pairs:
+            slot = key_totals.setdefault(
+                k, {"key": k, "cost": 0.0, "resources": 0, "distinct": set()})
+            slot["cost"] += cost
+            slot["resources"] += 1
+            slot["distinct"].add(v)
+
+    keys_out = sorted(key_totals.values(), key=lambda k: (-k["cost"], k["key"].lower()))
+    for k in keys_out:
+        k["cost"] = round(k["cost"], 2)
+        # How many values sit under this key, so the picker can show which keys are worth
+        # opening. A key with one value is a label; a key with nine is a breakdown.
+        distinct = k.pop("distinct")
+        k["platform"] = is_platform_key(k["key"], distinct)
+        k["values"] = len(distinct)
+    # Platform bookkeeping sinks below anything a person chose, whatever it costs. The
+    # ordering is the ranking most readers act on, so leaving an `aks-managed-*` key at
+    # the top because it rides on every node-pool disk answers a question nobody asked.
+    keys_out.sort(key=lambda k: (k["platform"], -k["cost"], k["key"].lower()))
+
+    return {
+        "keys": keys_out,
+        "platform_keys": sum(1 for k in keys_out if k["platform"]),
+        "resources": resources,
+        "values": pool,
+        "currency": currency,
+        "native_currencies": native_currencies,
+        "mixed": mixed,
+        "tagged": {"cost": round(tagged_cost, 2), "resources": tagged_count},
+        "untagged": {"cost": round(untagged_cost, 2), "resources": untagged_count},
+        "unknown": {"cost": round(unknown_cost, 2), "resources": unknown_count},
+        "tags_not_loaded": missing_tags,
+        "total": round(tagged_cost + untagged_cost + unknown_cost, 2),
+        "days": days,
+        "truncated": truncated,
+        "dates": dates,
+        "daily_total": [round(v, 2) for v in daily_total],
+        "daily_dropped": daily_dropped,
+        "totals_scope": "returned_resources",
+        "latest": str(hi),
+    }
+
+
+def _currency_predicate(code: str) -> str:
+    """`COALESCE(NULLIF("BillingCurrency", ''), 'unknown') = code`, in a form the planner can estimate.
+
+    For any code other than "unknown" the two are the same predicate -- a blank or NULL
+    currency becomes "unknown", which never equals another code -- but only the bare column
+    comparison has statistics. The expression was estimated at 0.5% of rows (205 for 29,481),
+    so a scoped month grouped its resources by sorting their identifiers rather than hashing.
+    """
+    escaped = code.replace("'", "''")
+    if code == "unknown":
+        return f'COALESCE(NULLIF("BillingCurrency", \'\'), \'unknown\') = \'{escaped}\''
+    return f'"BillingCurrency" = \'{escaped}\''
+
+
+def _resources_and_cells(r: Any, agg: str, named: str, window: str, lateral: str
+                         ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The top resources and their per-day cells, from one pass over the window.
+
+    The same two answers the full resource query and the daily query give separately --
+    every figure is still a SUM over the source rows, per resource and per resource-day --
+    but the window is read and grouped once rather than twice. Identifiers are grouped
+    bytewise: the database collation is deterministic, so its groups are exactly those, and
+    a locale-aware comparison per row was most of the grouping time. They are ordered and
+    tag-matched in the database collation, as before. "Exactly one subscription" compares the
+    smallest and largest spelling bytewise, which is the distinct count of one it replaces.
+    """
+    resource_id = """COALESCE(NULLIF("ResourceId", ''), "ResourceName", '(unnamed)')"""
+    found = r.rows(
+        f"""
+        WITH names AS (
+          SELECT "SubAccountId" AS name_sub, MAX("SubAccountName") AS name_text
+          FROM {agg} WHERE {window} GROUP BY 1
+        ), grouped AS MATERIALIZED (
+          SELECT {resource_id} COLLATE "C"                            AS idc,
+                 COALESCE(NULLIF("BillingCurrency", ''), 'unknown')    AS currency,
+                 "ChargePeriodStart"                                   AS day,
+                 GROUPING("ChargePeriodStart")                         AS whole,
+                 MAX(COALESCE(NULLIF("ResourceName", ''), '(unnamed)')) AS name,
+                 MAX(COALESCE("ServiceName", ''))                      AS service,
+                 MAX(COALESCE(name_text, ''))                          AS subscription,
+                 MAX(COALESCE("ResourceGroup", ''))                    AS resource_group,
+                 SUM(COALESCE("BilledCost", 0))                        AS cost,
+                 CASE WHEN MIN(COALESCE("SubAccountId", '') COLLATE "C")
+                           = MAX(COALESCE("SubAccountId", '') COLLATE "C")
+                      THEN MAX(NULLIF("SubAccountId", '')) END        AS subscription_id
+          FROM {named} LEFT JOIN names ON name_sub = "SubAccountId"
+          WHERE {window}
+          GROUP BY GROUPING SETS ((1, 2), (1, 2, "ChargePeriodStart"))
+        ), ranked AS (
+          SELECT idc COLLATE "default" AS id, name, service, subscription, resource_group,
+                 currency, cost, subscription_id
+          FROM grouped WHERE whole = 1
+          ORDER BY cost DESC, 1, currency
+          LIMIT {MAX_RESOURCES + 1}
+        ), top AS (
+          SELECT ranked.*, row_number() OVER (ORDER BY cost DESC, id, currency) AS seq FROM ranked
+        )
+        SELECT 0 AS part, top.seq, top.id, top.name, top.service, top.subscription,
+               top.resource_group, top.currency, top.cost, top.subscription_id,
+               tg.tags, NOT tg.unknown AS tags_available, NULL::date AS day
+        FROM top
+        {lateral}
+        UNION ALL
+        (SELECT 1, NULL, idc COLLATE "default", NULL, NULL, NULL, NULL, currency, cost,
+                NULL, NULL, NULL, day
+         FROM grouped WHERE whole = 0
+         LIMIT {MAX_DAILY_CELLS + 1})
+        """,
+        limit=None,
+    )
+    rows = sorted((row for row in found if row["part"] == 0), key=lambda row: row["seq"])
+    cells = [{"id": row["id"], "day": row["day"], "currency": row["currency"], "cost": row["cost"]}
+             for row in found if row["part"] == 1]
+    return rows, cells
+
+
+def _daily_cells_exceed_cap(r: Any, source: str, window: str, start: str,
+                            currency: str | None) -> bool:
+    """Whether the per-resource daily detail would exceed MAX_DAILY_CELLS -- only when provable.
+
+    False means "compute it and see", never "it fits": the caller then runs the query and
+    applies the cap exactly as before. True is returned only on proof:
+
+    * Cells are (resource, day, currency) groups, so there are never more cells than rows;
+      a window of at most MAX_DAILY_CELLS rows is answered by computing it (cheap then).
+    * Every resource active in the window owns at least one cell, so more active
+      resources than the cap -- read from `resource_counts` when it serves this reader --
+      proves the detail would be dropped. Identities without a `ResourceId` may collapse
+      under the tab's name fallback, so they are left out of that lower bound.
+    """
+    counts = getattr(r, "counts", None)
+    if not counts or currency == "unknown":
+        return False
+    from . import reporting, resource_counts
+
+    rows = r.rows(f"SELECT count(*) AS n FROM (SELECT 1 FROM {source} WHERE {window} "
+                  f"LIMIT {MAX_DAILY_CELLS + 1}) capped", None)
+    found = rows[0].get("n") if rows else None
+    if not isinstance(found, int) or found <= MAX_DAILY_CELLS:
+        return False
+    month = reporting.month_bounds()
+    served = r.rows(resource_counts.window_sql(counts, start, month[0] if month else None,
+                                               by_region=False), None)
+    active = sum(int(row.get("resources") or 0) for row in served
+                 if currency is None or row.get("currency") == currency)
+    # Two identities at most can merge under the fallback (NULL and '' resource ids).
+    return active - 2 > MAX_DAILY_CELLS
+
+
+def _empty(days: int) -> dict[str, Any]:
+    return {"keys": [], "platform_keys": 0, "resources": [], "values": [],
+            "currency": None, "mixed": False,
+            "native_currencies": {},
+            "tagged": {"cost": 0.0, "resources": 0},
+            "untagged": {"cost": 0.0, "resources": 0},
+            "unknown": {"cost": 0.0, "resources": 0}, "tags_not_loaded": False,
+            "total": 0.0, "days": days, "truncated": False,
+            "dates": [], "daily_total": [], "daily_dropped": False, "latest": None}
+
+
+def _dominant(rows: list[dict]) -> tuple[str | None, bool]:
+    totals: dict[str, float] = {}
+    for r in rows:
+        cur = r.get("currency") or "unknown"
+        totals[cur] = totals.get(cur, 0.0) + float(r.get("cost") or 0.0)
+    if not totals:
+        return None, False
+    if len(totals) == 1:
+        return next(iter(totals)), False
+    return max(totals, key=lambda c: totals[c]), True
+
+
+def _pairs(raw: Any) -> list[tuple[str, str]]:
+    """Tag key/value pairs from one cost row's tag column, sorted by key.
+
+    Values matter as much as keys. `Owner` is not a cost centre — `Owner=ana` and `Owner=bob`
+    are two cost centres that happen to share a key, and answering "what does Owner cost" by
+    adding them together is a number nobody asked for.
+
+    Azure has shipped this field in more than one shape over the years, and an export that
+    predates the current one is still a perfectly good export. A row whose tags cannot be read
+    is treated as untagged rather than crashing the tab — one malformed row should not cost
+    someone the whole view.
+    """
+    if not raw:
+        return []
+    text = str(raw).strip()
+    if not text or text in ("{}", "[]", "null"):
+        return []
+
+    out: dict[str, str] = {}
+
+    # The usual case: a JSON object.
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(parsed, dict):
+            return []
+        for k, v in parsed.items():
+            name = str(k).strip()
+            if name:
+                out[name] = "" if v is None else str(v).strip()
+        return sorted(out.items())
+
+    # Older exports emit `"key": "value"; "key2": "value2"` without the braces.
+    for part in text.replace(";", ",").split(","):
+        name, sep, value = part.partition(":")
+        if not sep:
+            continue
+        name = name.strip().strip('"').strip()
+        if name:
+            out[name] = value.strip().strip('"').strip()
+    return sorted(out.items())
+
+
+def _keys(raw: Any) -> list[str]:
+    """Just the key names. Kept for callers that do not care about values."""
+    return [k for k, _ in _pairs(raw)]

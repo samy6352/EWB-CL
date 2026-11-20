@@ -1,0 +1,944 @@
+<#
+.SYNOPSIS
+    Deploy CloudLens into an Azure subscription.
+
+.DESCRIPTION
+    Provisions the infrastructure from infra/main.bicep, grants the application's
+    managed identity the Cost Management access it needs on the subscriptions it
+    will analyse, and optionally publishes the application code.
+
+    Safe to re-run: the Bicep deployment is incremental and the role assignments
+    are idempotent.
+
+.EXAMPLE
+    ./infra/deploy.ps1 -Location centralindia
+
+.EXAMPLE
+    ./infra/deploy.ps1 -Location eastus -ResourceGroup rg-cloudlens-prod `
+        -CostScopeSubscriptions @('0000...','1111...') -SkipCode
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)]
+    [string]$Location,
+
+    [string]$ResourceGroup = 'rg-cloudlens',
+
+    [string]$NamePrefix = 'cloudlens',
+    [string]$NameSuffix = '',
+
+    # Optional reviewed legacy name. Existing configured storage is always preserved.
+    [string]$StorageAccountName = '',
+
+    # Keep this file between preview/apply and pipeline runs. Default is scoped to subscription/RG.
+    [string]$StorageNameStatePath = '',
+
+    # Region for the AI Foundry account. Deliberately separate from -Location:
+    # the regions with App Service quota and the regions offering a model on a
+    # pay-as-you-go SKU are different sets, and centralindia -- the default for
+    # the app -- offers gpt-4.1-mini only as reserved capacity.
+    [string]$AiLocation = 'eastus2',
+
+    [string]$ModelName = 'gpt-4.1-mini',
+
+    [string]$ModelSku = 'GlobalStandard',
+
+    # Create the Entra app registration people sign in through, and point the app
+    # at it. Needs directory rights: Application Developer or higher. Where the
+    # identity team owns app registrations, have them create one and pass its
+    # client ID with -EntraClientId instead.
+    [switch]$SkipEntra,
+
+    # An existing app registration to use rather than creating one. Its redirect
+    # URI is updated to match this deployment's hostname.
+    [string]$EntraClientId = '',
+
+    # Keep the existing default for redeployments; use a new stable value for an independent stack.
+    [string]$EntraAppUniqueName = 'cloudlens',
+
+    # Explicit opt-in only: limited mode uses the application's ARM identity.
+    [switch]$AllowAppIdentityFallback,
+
+    # Deliberately skip delegated ARM consent and never upgrade to delegated mode.
+    [switch]$AppIdentityOnly,
+
+    # Required when deploying as a service principal; its display name is not a user sign-in.
+    [string[]]$Admins = @(),
+
+    # False deploys the development shape: public endpoints restricted by
+    # firewall, no virtual network. Some tenants forbid public storage endpoints
+    # by policy, in which case only the isolated shape will deploy at all.
+    [bool]$NetworkIsolation = $true,
+
+    [string]$VnetAddressPrefix = '10.70.0.0/16',
+    [string]$AppSubnetAddressPrefix = '10.70.1.0/24',
+    [string]$PostgresSubnetAddressPrefix = '10.70.2.0/24',
+    [string]$PrivateEndpointSubnetAddressPrefix = '10.70.3.0/24',
+
+    [ValidateRange(1, 1000000)]
+    [int]$ModelCapacity = 30,
+
+    # Reference capacity was measured against the multi-million-row estate. Override
+    # these values deliberately for smaller deployments or where a region lacks a SKU.
+    [string]$PostgresSku = 'Standard_E2ds_v5',
+
+    [ValidateRange(32, 65536)]
+    [int]$PostgresStorageGb = 128,
+
+    [ValidateSet('11', '12', '13', '14', '15', '16', '17', '18')]
+    [string]$PostgresVersion = '16',
+
+    # PremiumV2_LRS provisions IOPS and throughput independently of capacity.
+    [ValidateSet('Premium_LRS', 'PremiumV2_LRS')]
+    [string]$PostgresStorageType = 'PremiumV2_LRS',
+
+    [ValidateRange(360, 80000)]
+    [int]$PostgresIops = 3000,
+
+    [ValidateRange(25, 1200)]
+    [int]$PostgresThroughput = 125,
+
+    # Partition a NEW costs table by month. Read once at application import and
+    # unable to convert a table that already exists, so it has to be right before
+    # the app first starts. Passed through the template rather than set afterwards
+    # with `az webapp config appsettings set`: appSettings is declared in the
+    # Bicep, so a later deployment discards anything the CLI added.
+    [switch]$PartitionCosts = $true,
+
+    [string]$PgWorkMem = '',
+
+    [string]$PgStatementTimeout = '25s',
+
+    # Off for a deployment whose data is loaded by other means: a boot with an
+    # empty warehouse would otherwise ingest this subscription's own costs and
+    # mix them into a restored estate. Production runs -AutoIngest:$false.
+    [bool]$AutoIngest = $true,
+
+    [ValidateRange(1, 13)]
+    [int]$InitialHistoryMonths = 3,
+
+    [bool]$AutoRefresh = $true,
+
+    [bool]$SnapshotWarmingEnabled = $true,
+
+    # Username/password sign-in alongside Entra, as production runs.
+    [bool]$AuthAllowLocal = $false,
+
+    # name:hash:role, PBKDF2. Never a plaintext password.
+    [string]$AuthUsers = '',
+
+    [string]$PgSchema = '',
+
+    [string]$AppServicePlanSku = 'B2',
+
+    # Subscriptions the application should be able to read cost data from.
+    # Defaults to the subscription being deployed into.
+    [string[]]$CostScopeSubscriptions = @(),
+
+    # Grant cost access on every enabled subscription this deployer can see. The blunt
+    # instrument for app-identity mode, where anything CloudLens cannot read is invisible to
+    # everyone regardless of their own rights.
+    [switch]$CostScopeAllVisible,
+
+    # Grant cost access once at a management group instead; it covers every subscription under
+    # it, including ones added later. Mutually exclusive with the two options above.
+    [string]$CostScopeManagementGroup = '',
+
+    # Opt in to managing export schedules/budgets; read-only cost access is the default.
+    [switch]$EnableExportManagement,
+
+    # The app creates its own FOCUS exports and imports the last 3 months on first start
+    # (CLOUDLENS_MANAGED_EXPORTS); earlier months, up to 13, are optional from Setup.
+    # Needs -EnableExportManagement; infra/install.ps1 sets both.
+    [bool]$ManagedExports = $false,
+
+    # Skip provisioning the FOCUS exports CloudLens imports from.
+    #
+    # They are provisioned by default because a deployment without them is quietly
+    # half-built: Quick refresh works, so the dashboard looks healthy, while Hourly Billing,
+    # Applications & Tags and scheduling savings stay empty because a query cannot return
+    # UnitOfMeasure, PricingQuantity, MeterName or Tags. Nothing errors. Somebody notices
+    # weeks later.
+    #
+    # This step needs rights the running application deliberately never has -- see
+    # infra/focus-exports.ps1 -- so deployment time, as an operator, is the only honest
+    # moment to do it. Pass this to defer it, then run focus-exports.ps1 separately.
+    [switch]$SkipFocusExports,
+
+    # Non-secret identity/role handoff. Defaults to ignored data\cost-access\<run>.json.
+    [string]$CostAccessReportPath = '',
+
+    # Skip the code publish and only touch infrastructure.
+    [switch]$SkipCode,
+    [string]$PackagePython = '',
+    [switch]$UsePrebuiltUi,
+
+    # Show what the deployment would change and stop. The equivalent of
+    # `terraform plan`, and the thing to run before touching a customer's
+    # subscription.
+    [switch]$WhatIf,
+
+    # Transient ARM write failures are common under private networking and role-assignment
+    # propagation; retry infra deployment attempts before failing the whole install.
+    [ValidateRange(0, 3)]
+    [int]$InfrastructureRetryCount = 1,
+
+    [ValidateRange(15, 300)]
+    [int]$InfrastructureRetryDelaySeconds = 45,
+
+    # Also write the compiled ARM template to infra/main.json, for customers
+    # whose platform team deploys through Terraform. See infra/terraform.
+    [switch]$EmitArm
+)
+
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $PSScriptRoot
+if ($ManagedExports -and -not $EnableExportManagement) {
+    throw '-ManagedExports needs -EnableExportManagement: the app creates and runs exports with Cost Management Contributor.'
+}
+. (Join-Path $PSScriptRoot 'deployment-checks.ps1')
+. (Join-Path $PSScriptRoot 'cost-access.ps1')
+. (Join-Path $PSScriptRoot 'storage-naming.ps1')
+if ($NetworkIsolation) {
+    $network = Get-CloudLensIpv4Range $VnetAddressPrefix
+    $subnets = @($AppSubnetAddressPrefix, $PostgresSubnetAddressPrefix, $PrivateEndpointSubnetAddressPrefix)
+    foreach ($subnet in $subnets) {
+        $range = Get-CloudLensIpv4Range $subnet
+        if ($range.Start -lt $network.Start -or $range.End -gt $network.End) {
+            throw "Subnet $subnet must be contained in $VnetAddressPrefix."
+        }
+    }
+    foreach ($subnet in @($AppSubnetAddressPrefix, $PostgresSubnetAddressPrefix)) {
+        if ([int]$subnet.Split('/')[1] -gt 28) { throw "Delegated subnet $subnet must be /28 or larger." }
+    }
+    for ($i = 0; $i -lt $subnets.Count; $i++) {
+        for ($j = $i + 1; $j -lt $subnets.Count; $j++) {
+            if (Test-CloudLensIpv4Overlap $subnets[$i] $subnets[$j]) {
+                throw "Subnets $($subnets[$i]) and $($subnets[$j]) overlap."
+            }
+        }
+    }
+}
+
+if (-not $script:InstallStart) {
+    $script:InstallStart = if ($env:CLOUDLENS_INSTALL_START) { [datetime]::Parse($env:CLOUDLENS_INSTALL_START, $null, 'RoundtripKind') } else { [datetime]::UtcNow }
+}
+$script:StepPrefix = if ($env:CLOUDLENS_PARENT_STEP) { "$($env:CLOUDLENS_PARENT_STEP)." } else { '' }
+$script:StepNumber = 0
+function Get-ElapsedText { $e = [datetime]::UtcNow - $script:InstallStart; '{0:00}:{1:00}' -f [int][math]::Floor($e.TotalMinutes), $e.Seconds }
+
+function Step($message) {
+    $script:StepNumber++
+    Write-Host ""
+    Write-Host "==> [$(Get-ElapsedText)] Step $($script:StepPrefix)$($script:StepNumber): $message" -ForegroundColor Cyan
+    Write-Progress -Activity 'CloudLens deployment' -Status "Step $($script:StepNumber): $message" -PercentComplete ([math]::Min(95, $script:StepNumber * 7))
+}
+
+function Wait-CloudLensInfrastructure([string]$Name, [string]$Group, [hashtable]$Baseline = @{}) {
+    <# Follows a --no-wait subscription deployment: new resources as they appear, a heartbeat, the final state. #>
+    $seen = @{}
+    $existing = $Baseline.Count
+    $lastBeat = Get-Date
+    while ($true) {
+        $raw = az resource list --resource-group $Group --query '[].[type,name]' -o json --only-show-errors 2>$null
+        if ($LASTEXITCODE -eq 0 -and $raw) {
+            foreach ($r in ($raw | ConvertFrom-Json)) {
+                $key = "$($r[0])/$($r[1])"
+                if (-not $seen.ContainsKey($key)) {
+                    $seen[$key] = $true
+                    if ($Baseline.ContainsKey($key)) { continue }
+                    Write-Host ("    [{0}] new        {1,-45} {2}" -f (Get-ElapsedText), $r[0], $r[1])
+                }
+            }
+        }
+        $state = az deployment sub show --name $Name --query properties.provisioningState -o tsv --only-show-errors 2>$null
+        if ($state -in 'Succeeded', 'Failed', 'Canceled') { break }
+        if (((Get-Date) - $lastBeat).TotalSeconds -ge 60) {
+            Write-Host ("    [{0}] still deploying ({1} new resources so far, state {2})" -f (Get-ElapsedText), ($seen.Count - $existing), $(if ($state) { $state } else { 'Starting' }))
+            $lastBeat = Get-Date
+        }
+        Write-Progress -Activity 'CloudLens deployment' -Status "Provisioning infrastructure: $($seen.Count - $existing) new resources" -PercentComplete ([math]::Min(60, 20 + $seen.Count - $existing))
+        Start-Sleep -Seconds 15
+    }
+    if ($state -ne 'Succeeded') {
+        $detail = az deployment sub show --name $Name --query properties.error -o json --only-show-errors 2>$null
+        $failedOps = @(Get-CloudLensFailedDeploymentOperations -DeploymentName $Name -ResourceGroup $Group)
+        $opsText = if ($failedOps.Count) {
+            "`nFailed deployment operations:`n  - " + ($failedOps -join "`n  - ")
+        } else {
+            ''
+        }
+        throw "Provisioning the infrastructure ended as $state. $detail$opsText"
+    }
+    Write-Host ("    [{0}] infrastructure ready ({1} resources in the group, {2} new)" -f (Get-ElapsedText), $seen.Count, ($seen.Count - $existing)) -ForegroundColor Green
+}
+
+function Get-CloudLensFailedDeploymentOperations([string]$DeploymentName, [string]$ResourceGroup) {
+    $summaries = [System.Collections.Generic.List[string]]::new()
+    $failedOps = @()
+    $raw = az deployment operation sub list --name $DeploymentName `
+        --query "[?properties.provisioningState=='Failed'].{type:properties.targetResource.resourceType,name:properties.targetResource.resourceName,code:properties.statusMessage.error.code,message:properties.statusMessage.error.message}" `
+        -o json --only-show-errors 2>$null
+    if ($LASTEXITCODE -eq 0 -and $raw) {
+        try { $failedOps = @($raw | ConvertFrom-Json) } catch { $failedOps = @() }
+    }
+
+    foreach ($op in $failedOps) {
+        $summaries.Add("$($op.type)/$($op.name): $($op.code) -- $($op.message)")
+    }
+
+    $nestedNames = @($failedOps |
+        Where-Object { $_.type -eq 'Microsoft.Resources/deployments' -and $_.name } |
+        ForEach-Object { $_.name } |
+        Select-Object -Unique)
+    foreach ($nested in $nestedNames) {
+        $nestedRaw = az deployment operation group list --resource-group $ResourceGroup --name $nested `
+            --query "[?properties.provisioningState=='Failed'].{type:properties.targetResource.resourceType,name:properties.targetResource.resourceName,code:properties.statusMessage.error.code,message:properties.statusMessage.error.message}" `
+            -o json --only-show-errors 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $nestedRaw) { continue }
+        $nestedFailed = @()
+        try { $nestedFailed = @($nestedRaw | ConvertFrom-Json) } catch { $nestedFailed = @() }
+        foreach ($op in $nestedFailed) {
+            $summaries.Add("[$nested] $($op.type)/$($op.name): $($op.code) -- $($op.message)")
+        }
+    }
+    return @($summaries | Select-Object -Unique | Select-Object -First 12)
+}
+
+function Assert-AzSuccess([string]$Operation) {
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Operation failed (Azure CLI exit $LASTEXITCODE). Deployment is incomplete."
+    }
+}
+
+# The permissions CloudLens asks for, and the only ones this installer will ever
+# consent to on a registration it did not create. Kept in step with
+# infra/modules/identity.bicep, which requests exactly these.
+$CloudLensResourceAccess = @{
+    # Microsoft Graph: sign someone in and learn their name. Nothing more --
+    # cost data is read with the app's own identity or the caller's ARM token.
+    '00000003-0000-0000-c000-000000000000' = @{
+        name = 'Microsoft Graph'
+        scopes = @{
+            '37f7f235-527c-4136-accd-4a02d197296e' = 'openid'
+            '14dad69e-099b-42c9-810b-d002981feec1' = 'profile'
+            '7427e0e9-2fba-42fe-b0c0-848c9e6a8182' = 'offline_access'
+            'e1fe6dd8-ba31-4d61-89e7-88639da4683d' = 'User.Read'
+        }
+    }
+    # Azure Resource Manager: ask ARM as the signed-in person rather than as the app.
+    '797f4846-ba00-4fd7-ba43-dac1f8f63013' = @{
+        name = 'Azure Resource Manager'
+        scopes = @{ '41094075-9dad-400e-a0bd-54e686782033' = 'user_impersonation' }
+    }
+}
+
+function Assert-AdoptableRegistration([string]$ClientId) {
+    <#
+    .SYNOPSIS
+        Refuse to touch an app registration that is not a CloudLens sign-in app.
+
+    .DESCRIPTION
+        `-EntraClientId` exists so an identity team can create the registration and
+        hand back its client id. The cost of that convenience is that a mistyped or
+        pasted-from-the-wrong-window id names somebody else's application, and the
+        three things this script then does to it are all silent and all wrong:
+
+          * adds a redirect URI pointing at this deployment,
+          * adds delegated Azure Resource Manager access,
+          * grants tenant-wide administrator consent for *everything it requests*.
+
+        The third is the severe one. `az ad app permission admin-consent` consents
+        to the whole of `requiredResourceAccess`, so pointing this at an app that
+        happens to request `Directory.ReadWrite.All` would grant that, to that app,
+        for every user in the tenant -- from a typo, with no prompt.
+
+        So the registration is read once and checked before anything is written to
+        it. The checks are deliberately conservative: each one describes a property
+        a genuine CloudLens sign-in registration has, and anything else is refused
+        by name rather than adopted hopefully.
+    #>
+    Step "Checking the registration $ClientId may be adopted"
+    $json = az ad app show --id $ClientId -o json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $json) {
+        throw ("The sign-in registration '$ClientId' could not be read. Check the client id, " +
+               "and that you can see it in this tenant. Nothing has been changed.")
+    }
+    $app = $json | ConvertFrom-Json
+    $name = if ($app.displayName) { $app.displayName } else { '(no display name)' }
+    Write-Host "    adopting     : $name"
+
+    $refusals = @()
+
+    # A multi-tenant registration is used by directories this deployment has no
+    # business altering, and consenting for it reaches further than this tenant.
+    if ($app.signInAudience -ne 'AzureADMyOrg') {
+        $refusals += "its sign-in audience is '$($app.signInAudience)', not the single-tenant AzureADMyOrg"
+    }
+
+    # An app exposing roles or an API is a platform component; CloudLens's own
+    # registration exposes neither.
+    if (@($app.appRoles | Where-Object { $_ }).Count) {
+        $refusals += "it exposes $(@($app.appRoles).Count) app role(s)"
+    }
+    if (@($app.api.oauth2PermissionScopes | Where-Object { $_ }).Count) {
+        $refusals += "it exposes its own API scope(s)"
+    }
+
+    # CloudLens signs people in as a public client with PKCE and never holds a
+    # secret, so credentials here mean this is a different kind of application --
+    # and a `web` redirect URI would make Entra refuse the code exchange anyway
+    # (AADSTS7000218), which is a confusing failure to ship into.
+    if (@($app.passwordCredentials | Where-Object { $_ }).Count -or
+        @($app.keyCredentials | Where-Object { $_ }).Count) {
+        $refusals += "it holds client credentials, which a PKCE public client does not use"
+    }
+    if (@($app.web.redirectUris | Where-Object { $_ }).Count) {
+        $refusals += "it has web-platform redirect URIs, which make it a confidential client"
+    }
+
+    # The check that makes the later admin-consent safe.
+    foreach ($resource in @($app.requiredResourceAccess | Where-Object { $_ })) {
+        $known = $CloudLensResourceAccess[$resource.resourceAppId]
+        if (-not $known) {
+            $refusals += "it requests permissions from an API CloudLens does not use ($($resource.resourceAppId))"
+            continue
+        }
+        foreach ($access in @($resource.resourceAccess | Where-Object { $_ })) {
+            if ($access.type -ne 'Scope') {
+                $refusals += "it requests an application permission on $($known.name), which CloudLens never needs"
+            }
+            elseif (-not $known.scopes.ContainsKey($access.id)) {
+                $refusals += "it requests an unrecognised $($known.name) permission ($($access.id))"
+            }
+        }
+    }
+
+    if ($refusals.Count) {
+        Write-Warning "This registration is not a CloudLens sign-in application:"
+        foreach ($refusal in $refusals) { Write-Warning "  - $refusal" }
+        Write-Warning ""
+        Write-Warning "Nothing has been changed. Either pass the correct -EntraClientId, or omit"
+        Write-Warning "it and let this script create a registration for you."
+        throw ("Refusing to modify app registration '$ClientId' ($name): it is not owned by this " +
+               "deployment and adopting it would alter, and consent for, an application in use elsewhere.")
+    }
+    Write-Host "    checks       : single-tenant, no credentials, no extra permissions" -ForegroundColor Green
+}
+
+# ------------------------------------------------------------ preconditions
+
+if ($EntraClientId) { Assert-AdoptableRegistration $EntraClientId }
+
+Step "Checking sign-in"
+$account = az account show -o json | ConvertFrom-Json
+Assert-AzSuccess 'Reading the active Azure account'
+if (-not $account) { throw "Not signed in. Run 'az login' first." }
+Write-Host "    subscription : $($account.name) ($($account.id))"
+Write-Host "    tenant       : $($account.tenantId)"
+
+# The deploying principal becomes the PostgreSQL administrator. Password
+# authentication is disabled on the server, so without this nobody -- including
+# the person running this script -- can connect to it afterwards.
+Step "Resolving the deploying principal"
+$signedIn = az ad signed-in-user show -o json 2>$null | ConvertFrom-Json
+if ($signedIn) {
+    $adminObjectId = $signedIn.id
+    $adminName = $signedIn.userPrincipalName
+    $adminType = 'User'
+} else {
+    # Running as a service principal, e.g. in a pipeline.
+    $spAppId = (az account show --query user.name -o tsv)
+    $sp = az ad sp show --id $spAppId -o json | ConvertFrom-Json
+    Assert-AzSuccess 'Resolving the deployment service principal'
+    $adminObjectId = $sp.id
+    $adminName = $sp.displayName
+    $adminType = 'ServicePrincipal'
+}
+Write-Host "    administrator: $adminName ($adminType)"
+if (-not $adminObjectId -or -not $adminName) {
+    throw 'The deployment principal could not be resolved.'
+}
+if (-not $SkipEntra -or $EntraClientId) {
+    if (-not $Admins.Count) {
+        if ($adminType -ne 'User') {
+            throw 'Pass -Admins with the customer administrator sign-in addresses when deploying from a pipeline.'
+        }
+        $Admins = @($signedIn.mail, $adminName) | Where-Object { $_ } | Select-Object -Unique
+    }
+}
+
+$developerIp = ''
+if (-not $NetworkIsolation) {
+    # Only needed to punch a hole in the public PostgreSQL firewall, which the
+    # isolated shape does not have.
+    $developerIp = (Invoke-RestMethod -Uri 'https://api.ipify.org?format=json').ip
+    Write-Host "    client IP    : $developerIp"
+}
+
+# ---------------------------------------------------- stable export storage
+Step 'Resolving deployment-owned export storage'
+if (-not $StorageNameStatePath) {
+    $scopeBytes = [Text.Encoding]::UTF8.GetBytes("$($account.id)/$ResourceGroup".ToLowerInvariant())
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $scopeKey = [BitConverter]::ToString($sha.ComputeHash($scopeBytes)).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    $StorageNameStatePath = Join-Path (Join-Path (Join-Path $root 'data') 'deployments') "$scopeKey.storage.json"
+}
+$StorageAccountName = Get-CloudLensStorageAccountName -SubscriptionId $account.id `
+    -ResourceGroup $ResourceGroup -NamePrefix $NamePrefix -NameSuffix $NameSuffix `
+    -StorageAccountName $StorageAccountName -StatePath $StorageNameStatePath
+
+# ---------------------------------------------------- deterministic name check
+#
+# Only when -NameSuffix is used. The default naming carries a hash of the resource
+# group id on these resources, so a collision there is already
+# improbable; a caller who asks for CL-web-prod has given that up on purpose and
+# is asking for a name another Azure tenant may already hold.
+#
+# PostgreSQL and the web app are unique across the whole of Azure, not
+# just this subscription. Checked here because the alternative is a partial
+# deployment: ARM creates the identity, the VNet and the workspace, then fails on
+# the name and leaves the resource group half-built.
+if ($NameSuffix) {
+    Step 'Checking globally-unique names are free'
+    $postgresCandidate = "$($NamePrefix.ToLower())-postgres-$($NameSuffix.ToLower())"
+    $webCandidate = "$NamePrefix-web-$NameSuffix"
+
+    # The request body goes via a file rather than an inline argument. A JSON string
+    # containing double quotes does not survive PowerShell's native-command argument
+    # handling intact, and az reports the result as an invalid URL segment or a missing
+    # content type -- which reads like the name was rejected rather than never checked.
+    function Test-AzureName {
+        param([string]$Url, [hashtable]$Body)
+        $file = New-TemporaryFile
+        try {
+            $Body | ConvertTo-Json -Compress | Set-Content -LiteralPath $file -Encoding utf8 -NoNewline
+            $raw = az rest --method post --url $Url --headers 'Content-Type=application/json' --body "@$file" -o json 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "name check failed: $raw" }
+            return ($raw | ConvertFrom-Json)
+        }
+        finally { Remove-Item -LiteralPath $file -ErrorAction SilentlyContinue }
+    }
+
+    $results = @(
+        @{ Kind = 'PostgreSQL server'; Name = $postgresCandidate; Type = 'Microsoft.DBforPostgreSQL/flexibleServers' }
+        @{ Kind = 'Web app'; Name = $webCandidate; Type = 'Microsoft.Web/sites' }
+    )
+
+    $taken = @()
+    foreach ($item in $results) {
+        # Ours already? Then this is a redeploy, not a collision. Checked before the
+        # availability API because that API answers "can this be created", and for a
+        # resource that already exists the answer is always no -- which would make the
+        # script refuse to run twice against its own deployment.
+        $mine = az resource list --resource-group $ResourceGroup --name $item.Name `
+            --resource-type $item.Type --query "[0].id" -o tsv 2>$null
+        if ($mine) {
+            Write-Host "    [ok]   $($item.Kind): $($item.Name) (exists in $ResourceGroup, will be updated)"
+            continue
+        }
+
+        $result = switch ($item.Kind) {
+            'PostgreSQL server' {
+                Test-AzureName -Url "https://management.azure.com/subscriptions/$($account.id)/providers/Microsoft.DBforPostgreSQL/checkNameAvailability?api-version=2024-08-01" `
+                               -Body @{ name = $item.Name; type = 'Microsoft.DBforPostgreSQL/flexibleServers' }
+            }
+            'Web app' {
+                Test-AzureName -Url "https://management.azure.com/subscriptions/$($account.id)/providers/Microsoft.Web/checknameavailability?api-version=2023-12-01" `
+                               -Body @{ name = $item.Name; type = 'Site' }
+            }
+        }
+
+        if ($result.nameAvailable) {
+            Write-Host "    [ok]   $($item.Kind): $($item.Name)"
+        }
+        else {
+            $why = $result.reason, $result.message | Where-Object { $_ } | Select-Object -First 1
+            Write-Host "    [FAIL] $($item.Kind): $($item.Name) -- $why" -ForegroundColor Red
+            $taken += $item.Name
+        }
+    }
+    if ($taken.Count) {
+        throw ("These names are taken elsewhere in Azure, or are invalid: " +
+               ($taken -join ', ') +
+               ". Choose a different -NameSuffix or -NamePrefix; nothing has been created.")
+    }
+}
+
+# ------------------------------------------------------------- provisioning
+
+# Preserve redirect URIs only from the registration this deployment will use.
+$priorRedirectUris = @()
+$registrationName = $EntraAppUniqueName.Replace("'", "''")
+$priorClientId = if ($EntraClientId) { $EntraClientId } else { (az ad app list --filter "uniqueName eq '$registrationName'" --query "[0].appId" -o tsv 2>$null) }
+if ($priorClientId) { $priorRedirectUris = @(az ad app show --id $priorClientId --query "publicClient.redirectUris" -o tsv 2>$null | Where-Object { $_ }) }
+
+Step "Deploying infrastructure to $ResourceGroup ($Location)"
+$deploymentName = "cloudlens-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+
+$templateFile = Join-Path $PSScriptRoot 'main.bicep'
+$templateParameters = @(
+    "location=$Location"
+    "resourceGroupName=$ResourceGroup"
+    "namePrefix=$NamePrefix"
+    "nameSuffix=$NameSuffix"
+    "storageAccountName=$StorageAccountName"
+    "adminPrincipalObjectId=$adminObjectId"
+    "adminPrincipalName=$adminName"
+    "adminPrincipalType=$adminType"
+    "networkIsolation=$($NetworkIsolation.ToString().ToLower())"
+    "vnetAddressPrefix=$VnetAddressPrefix"
+    "appSubnetAddressPrefix=$AppSubnetAddressPrefix"
+    "postgresSubnetAddressPrefix=$PostgresSubnetAddressPrefix"
+    "privateEndpointSubnetAddressPrefix=$PrivateEndpointSubnetAddressPrefix"
+    "developerClientIp=$developerIp"
+    "aiLocation=$AiLocation"
+    "modelName=$ModelName"
+    "modelSku=$ModelSku"
+    "modelCapacity=$ModelCapacity"
+    "postgresSku=$PostgresSku"
+    "postgresStorageGb=$PostgresStorageGb"
+    "postgresVersion=$PostgresVersion"
+    "postgresStorageType=$PostgresStorageType"
+    "postgresIops=$PostgresIops"
+    "postgresThroughput=$PostgresThroughput"
+    "partitionCosts=$($PartitionCosts.IsPresent.ToString().ToLower())"
+    "pgWorkMem=$PgWorkMem"
+    "pgStatementTimeout=$PgStatementTimeout"
+    "autoIngest=$($AutoIngest.ToString().ToLower())"
+    "initialHistoryMonths=$InitialHistoryMonths"
+    "autoRefresh=$($AutoRefresh.ToString().ToLower())"
+    "snapshotWarmingEnabled=$($SnapshotWarmingEnabled.ToString().ToLower())"
+    "authAllowLocal=$($AuthAllowLocal.ToString().ToLower())"
+    "authUsers=$AuthUsers"
+    "pgSchema=$PgSchema"
+    "appServicePlanSku=$AppServicePlanSku"
+    "entraAppUniqueName=$EntraAppUniqueName"
+    "deployEntraApp=$((-not $SkipEntra -and -not $EntraClientId).ToString().ToLower())"
+    "authDelegatedArm=$((-not ($AllowAppIdentityFallback -or $AppIdentityOnly)).ToString().ToLower())"
+    "managedExports=$($ManagedExports.ToString().ToLower())"
+)
+
+if ($EmitArm) {
+    # Terraform consumes the compiled ARM rather than a hand-written second
+    # definition, so there is only ever one description of the stack.
+    $armPath = Join-Path $PSScriptRoot 'main.json'
+    az bicep build --file $templateFile --outfile $armPath
+    Assert-AzSuccess 'Compiling the ARM template'
+    Write-Host "    ARM template : $armPath"
+}
+
+if ($WhatIf) {
+    Step "Previewing changes (nothing will be deployed)"
+    $PSNativeCommandUseErrorActionPreference = $false
+    $previewOutput = & az deployment sub what-if `
+        --name $deploymentName `
+        --location $Location `
+        --template-file $templateFile `
+        --parameters $templateParameters 2>&1
+    $previewExit = $LASTEXITCODE
+    if ($previewExit -ne 0) {
+        $previewDetail = $previewOutput -join "`n"
+        if ($previewDetail) { Write-Host "`nAzure What-If response:`n$previewDetail`n" }
+        if ($previewDetail -match 'Microsoft\.Authorization/roleAssignments/write') {
+            Write-Warning "Azure denied role-assignment creation. Ask the Azure administrator for '$ResourceGroup' in subscription '$($account.id)' to review the deploying identity's effective RBAC at the exact scope reported above, including role conditions, deny assignments and any required PIM activation. A listed Owner role alone does not establish access. Retry preview after an approved resolution."
+        }
+        throw "Previewing the infrastructure deployment failed (Azure CLI exit $previewExit). No resources were provisioned."
+    }
+    $previewOutput | Write-Host
+    Write-Host ""
+    Write-Host "Preview only. Re-run without -WhatIf to apply." -ForegroundColor Yellow
+    return
+}
+
+$zip = $null
+try {
+if (-not $SkipCode) {
+    Step 'Building and verifying the application package before provisioning'
+    $zip = Join-Path $root "cloudlens-$([guid]::NewGuid().ToString('N')).zip"
+    $package = & (Join-Path $root 'tools/package.ps1') -Destination $zip -SourceRoot $root `
+        -Python $PackagePython -SkipUiBuild:$UsePrebuiltUi
+    Write-Host "    package      : $($package.Files) files, $([math]::Round($package.Bytes / 1MB, 1)) MB"
+    Write-Host "    SHA-256      : $($package.Sha256)"
+}
+
+$maxAttempts = [math]::Max(1, $InfrastructureRetryCount + 1)
+$attempt = 0
+$finalDeploymentName = ''
+$provisioningError = $null
+while ($attempt -lt $maxAttempts) {
+    $attempt++
+    $attemptName = if ($attempt -eq 1) { $deploymentName } else { "$deploymentName-r$attempt" }
+    if ($attempt -gt 1) {
+        Write-Warning "Retrying infrastructure deployment ($attempt/$maxAttempts) in $InfrastructureRetryDelaySeconds seconds..."
+        Start-Sleep -Seconds $InfrastructureRetryDelaySeconds
+    }
+
+    $baseline = @{}
+    $rawBase = az resource list --resource-group $ResourceGroup --query '[].[type,name]' -o json --only-show-errors 2>$null
+    if ($LASTEXITCODE -eq 0 -and $rawBase) { foreach ($r in ($rawBase | ConvertFrom-Json)) { $baseline["$($r[0])/$($r[1])"] = $true } }
+
+    az deployment sub create `
+        --name $attemptName `
+        --location $Location `
+        --template-file $templateFile `
+        --parameters $templateParameters `
+        --no-wait --only-show-errors -o none
+    Assert-AzSuccess "Starting the infrastructure deployment (attempt $attempt of $maxAttempts)"
+    Write-Host "    started: this usually takes 10-25 minutes; new resources are listed as they appear"
+
+    try {
+        Wait-CloudLensInfrastructure -Name $attemptName -Group $ResourceGroup -Baseline $baseline
+        $finalDeploymentName = $attemptName
+        $provisioningError = $null
+        break
+    } catch {
+        $provisioningError = $_
+        if ($attempt -lt $maxAttempts) {
+            Write-Warning "Infrastructure attempt $attempt failed: $($_.Exception.Message)"
+            continue
+        }
+    }
+}
+if ($provisioningError) { throw $provisioningError }
+
+$result = az deployment sub show --name $finalDeploymentName --query properties.outputs -o json --only-show-errors | ConvertFrom-Json
+Assert-AzSuccess 'Reading the deployment outputs'
+
+if (-not $result) { throw "Deployment produced no outputs." }
+
+$webAppName = $result.webAppName.value
+$env:CLOUDLENS_WEBAPP_NAME = $webAppName
+$webAppUrl = $result.webAppUrl.value
+$redirectUri = "$webAppUrl/auth/callback"
+
+Write-Host "    web app      : $webAppName"
+Write-Host "    postgres     : $($result.postgresHost.value)"
+Write-Host "    storage      : $($result.storageAccount.value)"
+Write-Host "    foundry      : $($result.foundryAccount.value) ($AiLocation, $ModelName)"
+
+# Cost grants target the app's verified active identity, never the deploying human or
+# the sign-in registration. Every failure is reported before required scopes stop the run.
+Step 'Granting managed-identity cost access'
+$costAccess = Invoke-CloudLensCostAccess -HostingSubscriptionId $account.id -ResourceGroup $ResourceGroup `
+    -AppName $webAppName -CostScopeSubscriptions $CostScopeSubscriptions -CostScopeAllVisible:$CostScopeAllVisible `
+    -CostScopeManagementGroup $CostScopeManagementGroup `
+    -EnableExportManagement:$EnableExportManagement -ReportPath $CostAccessReportPath
+if ($costAccess.pendingSubscriptions.Count) {
+    Write-Warning 'Optional cost scopes remain pending; this deployment does not have complete cost coverage. Use infra\grant-cost-access.ps1 to repair access without redeploying.'
+}
+
+# ------------------------------------------------------------ FOCUS exports
+#
+# The data path the whole dashboard rests on, provisioned here because here is the only
+# place it can be. An export authenticates to storage with a *system-assigned* identity --
+# the API accepts no other kind -- so Azure mints a new identity per export that must then
+# be granted Storage Blob Data Contributor on the destination. Granting a role needs
+# Microsoft.Authorization/roleAssignments/write, and the runtime identity is deliberately
+# denied it (cost-access.ps1: "Never grant the runtime app subscription Owner or User Access
+# Administrator"). The operator running this deployment already holds those rights
+# legitimately; spending them once here is what keeps the application read-only forever.
+#
+# Preserve infrastructure on failure, but stop the installation handoff until required
+# exports are complete. -SkipFocusExports explicitly defers this operator-owned step.
+if (-not $SkipFocusExports) {
+    Step 'Provisioning FOCUS exports'
+    $focusScope = @($costAccess.subscriptions |
+        Where-Object { $_.validation -eq 'valid' -and $_.subscriptionId } |
+        ForEach-Object { $_.subscriptionId })
+    if (-not $focusScope -or $focusScope.Count -eq 0) { $focusScope = @($account.id) }
+
+    try {
+        # -WhatIf already returned above, so this only ever runs for real.
+        $focusResult = & (Join-Path $PSScriptRoot 'focus-exports.ps1') `
+            -ResourceGroup $ResourceGroup -WebAppName $webAppName `
+            -Subscriptions $focusScope -HostingSubscriptionId $account.id -RunNow
+        if ($focusResult.status -ne 'complete') { throw 'FOCUS provisioning did not return a complete result.' }
+        $focusProvisioned = $true
+    } catch {
+        $focusProvisioned = $false
+        Write-Warning "FOCUS exports were not provisioned: $($_.Exception.Message)"
+        Write-Warning 'The infrastructure exists, but installation is incomplete. Hourly Billing,'
+        Write-Warning 'Applications & Tags and scheduling savings stay empty until exports exist.'
+        Write-Warning 'Re-run infra\focus-exports.ps1 once the reported access is granted.'
+        throw
+    }
+} else {
+    $focusProvisioned = $false
+}
+
+# ------------------------------------------------------------------ sign-in
+#
+# The app shows the Microsoft button when AUTH_CLIENT_ID and AUTH_TENANT_ID are
+# set, and falls back to a local password when they are not. These cannot be set
+# in stack.bicep: the registration's redirect URI needs the web app's hostname,
+# so the app has to exist before the registration, and the client ID then has to
+# come back to the app it depends on.
+
+Step "Configuring sign-in"
+
+$clientId = $EntraClientId
+if (-not $clientId -and -not $SkipEntra) {
+    $clientId = $result.entraClientId.value
+}
+
+if ($clientId) {
+    $existingUris = @(az ad app show --id $clientId --query "publicClient.redirectUris" -o tsv 2>$null | Where-Object { $_ })
+    Assert-AzSuccess 'Reading the sign-in registration'
+    $wanted = @($existingUris + $priorRedirectUris + $redirectUri | Select-Object -Unique)
+    if (@($wanted | Where-Object { $existingUris -notcontains $_ }).Count) {
+        az ad app update --id $clientId --public-client-redirect-uris @wanted --only-show-errors -o none 2>$null
+        Assert-AzSuccess "Registering the redirect URI $redirectUri"
+        Write-Host "    redirect URI registered ($($wanted.Count) total, other stacks kept)"
+    }
+
+    if ($EntraClientId) {
+        # Adoption was validated before infrastructure creation or Graph writes.
+        # An existing registration. Its redirect URIs are whatever the identity
+        # team set, which will not include this deployment's hostname -- add it
+        # without disturbing the others.
+        #
+        # Public-client platform, not web: CloudLens redeems the code with PKCE
+        # and no secret, and Entra only allows that for a public client.
+
+        $requiredAccess = az ad app show --id $clientId --query requiredResourceAccess -o json | ConvertFrom-Json
+        Assert-AzSuccess 'Reading requested API permissions'
+        $armAccess = $requiredAccess | Where-Object { $_.resourceAppId -eq '797f4846-ba00-4fd7-ba43-dac1f8f63013' }
+        $armScope = @($armAccess.resourceAccess | Where-Object {
+            $_.id -eq '41094075-9dad-400e-a0bd-54e686782033' -and $_.type -eq 'Scope'
+        })
+        if (-not $AppIdentityOnly -and -not $armScope.Count) {
+            az ad app permission add --id $clientId --api '797f4846-ba00-4fd7-ba43-dac1f8f63013' `
+                --api-permissions '41094075-9dad-400e-a0bd-54e686782033=Scope' --only-show-errors -o none
+            Assert-AzSuccess 'Requesting delegated ARM permission'
+        }
+    }
+
+    az webapp config appsettings set `
+        --resource-group $ResourceGroup `
+        --name $webAppName `
+        --settings "AUTH_CLIENT_ID=$clientId" `
+                   "AUTH_TENANT_ID=$($account.tenantId)" `
+                   "AUTH_REDIRECT_URI=$redirectUri" `
+                   "AUTH_ADMINS=$($Admins -join ',')" `
+        --only-show-errors -o none
+    Assert-AzSuccess 'Applying sign-in settings'
+
+    Write-Host "    client id    : $clientId"
+    Write-Host "    redirect URI : $redirectUri"
+
+    # Delegated ARM is the default, and it is the reason the subscription list is correct
+    # rather than bounded by what this app's own identity can read. It needs a one-time tenant
+    # admin consent for `user_impersonation`, without which nobody can sign in at all -- so try
+    # it here rather than leaving a deployment that looks finished and refuses everyone at the
+    # door. AUTH_DELEGATED_ARM itself is carried by the template, not patched on here.
+    $consented = $false
+    if (-not $AppIdentityOnly) {
+        Step "Granting admin consent for delegated ARM access"
+        az ad app permission admin-consent --id $clientId --only-show-errors -o none 2>$null
+        $consented = $LASTEXITCODE -eq 0
+    }
+    if ($AppIdentityOnly) {
+        Write-Host '    App-identity mode selected: delegated ARM consent is not requested.'
+        Write-Host '    Subscription administrators must grant the runtime identity access to each approved scope.'
+    }
+    elseif ($consented -and -not $AllowAppIdentityFallback) {
+        Write-Host "    consented    : ARM user_impersonation" -ForegroundColor Green
+    }
+    elseif ($consented) {
+        # Fallback was requested but is no longer needed. Take the better mode rather than
+        # leaving a deployment permanently limited by a flag nobody remembers passing.
+        az webapp config appsettings set `
+            --resource-group $ResourceGroup `
+            --name $webAppName `
+            --settings "AUTH_DELEGATED_ARM=true" `
+            --only-show-errors -o none
+        Assert-AzSuccess 'Upgrading to delegated ARM after consent succeeded'
+        Write-Host "    consented    : ARM user_impersonation" -ForegroundColor Green
+        Write-Host "    -AllowAppIdentityFallback was not needed and has been ignored."
+    }
+    else {
+        Write-Warning "Consent was refused. This needs Cloud Application Administrator or"
+        Write-Warning "higher in $($account.tenantId), and is usually not the person who owns"
+        Write-Warning "the subscription. An administrator grants it with:"
+        Write-Warning "  az ad app permission admin-consent --id $clientId"
+        Write-Warning ""
+        if (-not $AllowAppIdentityFallback) {
+            throw 'Delegated ARM consent is required. Have the tenant administrator grant consent and rerun, or explicitly choose -AllowAppIdentityFallback for limited app-identity mode.'
+        }
+
+        # Leaving delegated ARM on after a refusal ships a deployment that looks finished and
+        # turns every single person away at the sign-in page, because the authorize request
+        # asks for a scope nobody is allowed to consent to. The template already carries
+        # AUTH_DELEGATED_ARM=false for this run, so people get in, and the subscription list
+        # is bounded by what CloudLens itself holds Reader on -- visible in the UI, unlike a
+        # door that will not open.
+        Write-Warning "Continuing in app-identity mode (AUTH_DELEGATED_ARM=false). People see the"
+        Write-Warning "subscriptions they hold a cost-capable role on, among those CloudLens was"
+        Write-Warning "granted Reader on. Once an administrator grants consent, rerun the same command to upgrade."
+    }
+} else {
+    if ($AuthUsers) {
+        Write-Host "    skipped -- local administrators come from AUTH_USERS (password hashes only)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "    skipped -- the app will use a local password" -ForegroundColor DarkGray
+        Write-Host "    the generated password is printed once into the log at first start:"
+        Write-Host "      az webapp log tail -g $ResourceGroup -n $webAppName"
+    }
+}
+
+# ------------------------------------------------------------------- code
+
+if (-not $SkipCode) {
+    Step "Publishing to $webAppName"
+    $scmHost = Get-CloudLensScmHost $webAppUrl
+    $receipt = Publish-CloudLensPackage -ScmHost $scmHost -PackagePath $zip
+    Write-Host '    uploading, then building on Azure (the first build takes 5-10 minutes)'
+    $published = Wait-CloudLensDeployment -ScmHost $scmHost -ReceiptUrl $receipt.ReceiptUrl -Deployer $receipt.Deployer
+    Write-Host "    build        : $($published.id) succeeded" -ForegroundColor Green
+
+    Step "Checking application readiness and sign-in"
+    Wait-CloudLensApplication -BaseUrl $webAppUrl -ExpectedReleaseId $package.ReleaseId
+}
+} finally {
+    if ($zip -and (Test-Path -LiteralPath $zip -PathType Leaf)) {
+        Remove-Item -LiteralPath $zip -Force -ErrorAction Continue
+    }
+}
+
+Step "Done"
+Write-Host "    $webAppUrl" -ForegroundColor Green
+Write-Host ""
+
+# State the data path explicitly. Without exports the dashboard still loads and Quick refresh
+# still works, so "it looks fine" is exactly the wrong signal to leave someone with.
+if ($ManagedExports) {
+    Write-Host "Cost detail  : CloudLens creates its own FOCUS exports and imports $InitialHistoryMonths calendar month(s)," -ForegroundColor Green
+    Write-Host "               newest month first. First data usually within hours (a new export can" -ForegroundColor Green
+    Write-Host "               take up to 24 h). Earlier months (up to 13) are optional on the Setup page:" -ForegroundColor Green
+    Write-Host "               $webAppUrl/v2/admin/setup" -ForegroundColor Green
+} elseif ($focusProvisioned) {
+    Write-Host "Cost detail  : FOCUS exports provisioned. Azure delivers the first reports" -ForegroundColor Green
+    Write-Host "               within a few hours; CloudLens imports them automatically." -ForegroundColor Green
+} else {
+    Write-Host "Cost detail  : no FOCUS exports. Quick refresh works, but Hourly Billing," -ForegroundColor Yellow
+    Write-Host "               Applications & Tags and scheduling savings will be empty." -ForegroundColor Yellow
+    Write-Host "               Fix with: infra\focus-exports.ps1 -ResourceGroup $ResourceGroup -WebAppName $webAppName -RunNow" -ForegroundColor Yellow
+}
+Write-Host ""
+
+if ($SkipCode) {
+    Write-Host 'Infrastructure/configuration only: application code was not published by this run.' -ForegroundColor Yellow
+    return
+}
+if ($clientId -and $consented) {
+    Write-Host "Sign in with the Microsoft button. Nothing further is required." -ForegroundColor Green
+} elseif ($clientId -and ($AllowAppIdentityFallback -or $AppIdentityOnly)) {
+    Write-Host "Sign in with the Microsoft button. Running in app-identity mode; visibility is limited to the approved runtime grants." -ForegroundColor Yellow
+} elseif ($clientId) {
+    Write-Host "Sign-in is configured but not yet consented -- see the warning above." -ForegroundColor Yellow
+} else {
+    Write-Host "Sign-in uses a local password. Re-run without -SkipEntra, or pass" -ForegroundColor Yellow
+    Write-Host "-EntraClientId <id>, to switch to the Microsoft button." -ForegroundColor Yellow
+}
