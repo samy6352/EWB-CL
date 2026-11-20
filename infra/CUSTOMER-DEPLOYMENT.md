@@ -161,8 +161,29 @@ and verifies a temporary ZIP and runs Azure What-If without provisioning. Use
 `-NoToolInstall` to require existing local tools, or pass `-SubscriptionId`
 to skip the hosting subscription prompt.
 
-For an intentional resume, use `install-customer.ps1` from the extracted
-customer bundle and provide the original settings and version:
+If a guided managed-identity install failed during Entra registration after
+creating the web app, use `tools\Repair-CloudLensDeployment.ps1` from the
+customer repository. Select the original subscription in Azure CLI and give
+the script the `-ResourceGroup` and original monitoring `-Scope` (not recorded
+in the ARM deployment). It inventories the group, locates the latest CloudLens
+deployment for it, and finds the retained source under `$HOME\CloudLens` by
+matching the storage naming state. It refuses to run while a deployment is
+active. If source discovery is ambiguous, pass `-SourceRoot` explicitly.
+Use `-EntraClientId` for a pre-approved
+registration with the existing app's callback already configured. Add `-Apply`
+to continue after review, or use `-CreateEntraApp -Apply` if the operator also
+has directory rights and approval to create the registration. The repair
+reuses the existing resource group, previews reconciliation, and resumes the
+installer's pending configuration and publication; it is not a restart-only operation.
+
+An authorised operator with both Azure deployment and Entra registration
+permissions can run `.\tools\Repair-CloudLensDeployment.ps1 -ResourceGroup
+<existing-group> -AutoApply` from the customer repository. This explicitly
+authorises creating the registration and applying recovery without prompts.
+The script requires a recorded Entra registration permission failure, confirms
+the original deployment is no longer active, and applies only after What-If
+succeeds. It defaults to monitoring only the hosting subscription; pass the
+original `-Scope` if wider coverage was approved and needs to be restored.
 
 ```powershell
 .\install-customer.ps1 -Version '<published-version>' `
