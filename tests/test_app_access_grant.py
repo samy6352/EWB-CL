@@ -18,14 +18,15 @@ PRINCIPAL = "44444444-4444-4444-8444-444444444444"
 def test_grant_is_idempotent_per_role_and_reports_denials(monkeypatch):
     monkeypatch.setenv("CLOUDLENS_PRINCIPAL_ID", PRINCIPAL)
     monkeypatch.setattr(bootstrap, "require_writable", lambda: None)
+    monkeypatch.setattr(cost, "acting_as_caller", lambda: True)
     calls: list[tuple[str, str, dict]] = []
 
     async def request(method, url, **kwargs):
         calls.append((method, url, kwargs["json_body"]))
         if DENIED_SUB in url:
-            raise cost.CostError("403 AuthorizationFailed")
+            raise cost.CostError("Azure returned 403", status_code=403)
         if OK_SUB in url:
-            raise cost.CostError("409 RoleAssignmentExists")
+            raise cost.CostError("Azure returned 409", status_code=409)
         return {}
 
     monkeypatch.setattr(cost.azure, "request", request)
@@ -44,8 +45,37 @@ def test_grant_is_idempotent_per_role_and_reports_denials(monkeypatch):
 def test_grant_needs_a_known_app_identity(monkeypatch):
     monkeypatch.delenv("CLOUDLENS_PRINCIPAL_ID", raising=False)
     monkeypatch.setattr(bootstrap, "require_writable", lambda: None)
+    monkeypatch.setattr(cost, "acting_as_caller", lambda: True)
     with pytest.raises(ValueError, match="CLOUDLENS_PRINCIPAL_ID"):
         asyncio.run(bootstrap.grant_app_access([NEW_SUB]))
+
+
+def test_grant_refuses_to_run_as_the_app_identity(monkeypatch):
+    monkeypatch.setenv("CLOUDLENS_PRINCIPAL_ID", PRINCIPAL)
+    monkeypatch.setattr(bootstrap, "require_writable", lambda: None)
+    monkeypatch.setattr(cost, "acting_as_caller", lambda: False)
+
+    async def request(*args, **kwargs):
+        raise AssertionError("no role assignment may be sent without the administrator's token")
+
+    monkeypatch.setattr(cost.azure, "request", request)
+    with pytest.raises(ValueError, match="own Azure sign-in"):
+        asyncio.run(bootstrap.grant_app_access([NEW_SUB]))
+
+
+def test_overview_without_a_personal_token_offers_no_grant(monkeypatch):
+    monkeypatch.setenv("CLOUDLENS_PRINCIPAL_ID", PRINCIPAL)
+
+    async def listing():
+        return {"subscriptions": [], "count": 0}
+
+    async def request(*args, **kwargs):
+        return {"state": "Enabled"}
+
+    monkeypatch.setattr(cost, "list_subscriptions", listing)
+    monkeypatch.setattr(cost.azure, "request", request)
+    out = asyncio.run(bootstrap.app_access_overview([{"id": NEW_SUB, "name": "x"}], as_caller=False))
+    assert not out["can_grant"] and out["subscriptions"] == []
 
 
 def test_overview_unions_app_and_user_subscriptions(monkeypatch):

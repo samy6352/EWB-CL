@@ -197,7 +197,7 @@ def principal_id() -> str | None:
     return os.getenv("CLOUDLENS_PRINCIPAL_ID") or None
 
 
-async def app_access_overview(user_subs: list[dict[str, Any]]) -> dict[str, Any]:
+async def app_access_overview(user_subs: list[dict[str, Any]], *, as_caller: bool = True) -> dict[str, Any]:
     """Every subscription the app's identity can read, plus those only the administrator can see.
 
     Each of the administrator's subscriptions is probed live as the workload identity, so the
@@ -225,7 +225,9 @@ async def app_access_overview(user_subs: list[dict[str, Any]]) -> dict[str, Any]
                     return False
                 return row.get("state") == "Enabled"
 
-        user_rows = [{"id": s["id"].lower(), "name": s.get("name")} for s in user_subs[:200]]
+        # Not acting as the person, "their" subscriptions would really be the app's own.
+        user_rows = ([{"id": s["id"].lower(), "name": s.get("name")} for s in user_subs[:200]]
+                     if as_caller else [])
         visible = await asyncio.gather(*(probe(s) for s in user_rows))
     finally:
         cost._caller.reset(tokens[0])
@@ -240,7 +242,7 @@ async def app_access_overview(user_subs: list[dict[str, Any]]) -> dict[str, Any]
         row.update(user_access=True, app_access=bool(row["app_access"] or ok), name=row.get("name") or s.get("name"))
     ordered = sorted(rows.values(), key=lambda r: (r["app_access"], (r.get("name") or r["id"]).lower()))
     return {"subscriptions": ordered, "listing_known": listing_known,
-            "can_grant": principal_id() is not None, "roles": list(ROLE_IDS)}
+            "can_grant": principal_id() is not None and as_caller, "roles": list(ROLE_IDS)}
 
 
 async def grant_app_access(ids: list[str]) -> list[dict[str, Any]]:
@@ -256,6 +258,11 @@ async def grant_app_access(ids: list[str]) -> list[dict[str, Any]]:
     from . import cost
 
     require_writable()
+    # Without the administrator's own delegated token these calls would run as the app's identity,
+    # which must never be the principal that assigns roles.
+    if not cost.acting_as_caller():
+        raise ValueError("Granting access needs your own Azure sign-in, which is not available here; "
+                         "use the grant commands instead.")
     pid = principal_id()
     if not pid:
         raise ValueError("This deployment does not know its app identity (CLOUDLENS_PRINCIPAL_ID is not set); "
@@ -278,9 +285,10 @@ async def grant_app_access(ids: list[str]) -> list[dict[str, Any]]:
                 roles[role] = "granted"
             except Exception as exc:  # noqa: BLE001 - reported per role
                 text = str(exc)
-                if "RoleAssignmentExists" in text or "409" in text:
+                status = getattr(exc, "status_code", None)
+                if status == 409 or "RoleAssignmentExists" in text:
                     roles[role] = "already granted"
-                elif "AuthorizationFailed" in text or "403" in text:
+                elif status in (401, 403) or "AuthorizationFailed" in text:
                     roles[role] = "denied"
                 else:
                     roles[role] = f"failed: {text[:160]}"

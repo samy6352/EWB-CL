@@ -3158,8 +3158,9 @@ async def cost_data_app_access(request: Request) -> JSONResponse:
     from . import bootstrap, cost
     user = require_admin(request)
     async with as_user(user):
-        mine = (await cost.list_subscriptions())["subscriptions"]
-    return JSONResponse(await bootstrap.app_access_overview(mine))
+        as_caller = cost.acting_as_caller()
+        mine = (await cost.list_subscriptions())["subscriptions"] if as_caller else []
+    return JSONResponse(await bootstrap.app_access_overview(mine, as_caller=as_caller))
 
 
 class GrantAccessRequest(BaseModel):

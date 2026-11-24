@@ -617,9 +617,18 @@ if ($useExistingNetwork) {
                 throw "$($entry.Label) subnet is delegated to $($delegations -join ', ') but must be delegated to $($entry.Delegation). Use a different subnet."
             }
             Write-Host "    $($entry.Label) subnet has no delegation; adding $($entry.Delegation)..."
-            $updated = az network vnet subnet update --ids $entry.Id --delegations $entry.Delegation -o json 2>&1
             $updatedSubnet = $null
-            if ($LASTEXITCODE -eq 0) { $updatedSubnet = $updated | ConvertFrom-Json }
+            $previousPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $updated = az network vnet subnet update --ids $entry.Id --delegations $entry.Delegation --only-show-errors -o json 2>$null
+                if ($LASTEXITCODE -eq 0) { $updatedSubnet = $updated | ConvertFrom-Json }
+            } catch { $updatedSubnet = $null }
+            finally { $ErrorActionPreference = $previousPreference }
+            if (-not $updatedSubnet) {
+                # The update may have applied even though its output was unreadable; confirm before failing.
+                $updatedSubnet = az network vnet subnet show --ids $entry.Id -o json 2>$null | ConvertFrom-Json
+            }
             if (-not $updatedSubnet -or (@($updatedSubnet.delegations | ForEach-Object { $_.serviceName }) -notcontains $entry.Delegation)) {
                 throw "$($entry.Label) subnet must be delegated to $($entry.Delegation) and the installer could not add it (needs Microsoft.Network/virtualNetworks/subnets/write on the VNet, and the subnet must hold no other resources). $manualFix"
             }
