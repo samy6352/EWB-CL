@@ -78,7 +78,7 @@ function Sidebar() {
         {!collapsed && (
           <div className="hidden min-w-0 sm:block">
             <div className="text-sm font-semibold tracking-tight">CloudLens</div>
-            <div className="text-[11px] text-muted">v3 preview</div>
+            <div className="text-[11px] text-muted">Cloud cost intelligence</div>
           </div>
         )}
       </Link>
