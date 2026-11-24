@@ -190,7 +190,7 @@ class DeploymentFailures(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT / ".pytest_cache", ignore_cleanup_errors=True) as work:
             state = str(Path(work) / "storage.json").replace("'", "''")
             report = str(Path(work) / "cost-access.json").replace("'", "''")
-            command = f"$scenario = '{scenario}'\n{MOCK}\n& '{script}' -Location eastus2 -StorageNameStatePath '{state}' -CostAccessReportPath '{report}' {options}"
+            command = f"$scenario = '{scenario}'\n{MOCK}\n& '{script}' -Location eastus2 -StorageNameStatePath '{state}' -CostAccessReportPath '{report}' -SkipFocusExports {options}"
             return subprocess.run([POWERSHELL, "-NoProfile", "-Command", command],
                                   capture_output=True, text=True, timeout=60)
 

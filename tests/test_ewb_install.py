@@ -49,6 +49,7 @@ exit $global:preflightCode
 
 
 @unittest.skipUnless(PWSH, "PowerShell 7 required")
+@unittest.skipUnless((ROOT / "infra" / "install-ewb.ps1").exists(), "install-ewb.ps1 is not part of this repository")
 class EwbInstaller(unittest.TestCase):
     def run_launcher(self, options="", *, answers=(), exists=False, blocked=False,
                      fail_apply=False, signed_in=True, fail_cli=False, strict_parent=False,
