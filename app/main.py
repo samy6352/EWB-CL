@@ -3152,6 +3152,42 @@ async def add_cost_data_subscriptions(body: AddSubscriptionsRequest, request: Re
     return JSONResponse(plan)
 
 
+@app.get("/api/cost-data/app-access")
+async def cost_data_app_access(request: Request) -> JSONResponse:
+    """Subscriptions the app identity can read, and the administrator's own that it cannot yet."""
+    from . import bootstrap, cost
+    user = require_admin(request)
+    async with as_user(user):
+        mine = (await cost.list_subscriptions())["subscriptions"]
+    return JSONResponse(await bootstrap.app_access_overview(mine))
+
+
+class GrantAccessRequest(BaseModel):
+    subscription_ids: list[str] = Field(min_length=1, max_length=50)
+
+
+@app.post("/api/cost-data/grant-app-access")
+async def grant_cost_data_app_access(body: GrantAccessRequest, request: Request) -> JSONResponse:
+    """Grant the app identity its roles on the chosen subscriptions, as the signed-in administrator.
+
+    The assignment is written with that person's token, so Azure only allows it where they could
+    have run the grant command themselves; nothing here widens what they are permitted to do.
+    """
+    from . import bootstrap
+    user = require_admin(request)
+    if read_only_mode():
+        raise HTTPException(409, "This deployment is read-only.")
+    try:
+        async with as_user(user):
+            results = await bootstrap.grant_app_access(body.subscription_ids)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    onboarding = None
+    if any(r["ok"] for r in results) and bootstrap.enabled():
+        onboarding = await bootstrap.run_once()
+    return JSONResponse({"results": results, "onboarding": onboarding})
+
+
 @app.get("/api/cost-data/subscriptions")
 async def cost_data_subscriptions(request: Request) -> JSONResponse:
     """Entitled catalog only: unlike the legacy picker this never schedules backfill."""

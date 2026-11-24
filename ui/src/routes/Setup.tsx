@@ -206,6 +206,84 @@ function History({ data, admin, onSaved }: { data: SetupProgress; admin: boolean
   );
 }
 
+type AccessRow = { id: string; name?: string | null; app_access: boolean; user_access: boolean };
+type AccessOverview = { subscriptions: AccessRow[]; listing_known: boolean; can_grant: boolean; roles: string[] };
+type GrantOutcome = { id: string; ok: boolean; roles: Record<string, string>; detail: string };
+
+/** Subscriptions the app identity can read, with a one-click grant for those it cannot yet. */
+function AppAccess({ onDone }: { onDone: (message: string) => void }) {
+  const access = useQuery({ queryKey: ["app-access"], queryFn: ({ signal }) => api<AccessOverview>("cost-data/app-access", undefined, { signal }), staleTime: 30_000 });
+  const [busy, setBusy] = useState<string | null>(null);
+  const [outcomes, setOutcomes] = useState<Record<string, GrantOutcome>>({});
+  const [error, setError] = useState<string | null>(null);
+  const data = access.data;
+  const lacking = data?.subscriptions.filter((s) => !s.app_access && s.user_access) ?? [];
+
+  const grant = async (ids: string[], label: string) => {
+    setBusy(label);
+    setError(null);
+    try {
+      const out = await api<{ results: GrantOutcome[] }>("cost-data/grant-app-access", undefined, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subscription_ids: ids }),
+      });
+      setOutcomes((prev) => ({ ...prev, ...Object.fromEntries(out.results.map((r) => [r.id, r])) }));
+      const done = out.results.filter((r) => r.ok).length;
+      if (done) onDone(`Access granted on ${done} subscription${done === 1 ? "" : "s"}. Role assignments can take a few minutes to apply, then setup continues by itself.`);
+      await access.refetch();
+    } catch (e) {
+      setError(e instanceof ApiError || e instanceof Error ? e.message : "The grant failed.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  if (access.isLoading) return <Skeleton className="mb-5 h-24 w-full" />;
+  if (!data || !data.subscriptions.length) return null;
+  return (
+    <Card className="mb-5">
+      <CardHeader
+        title="Subscription access"
+        subtitle="Subscriptions CloudLens's own identity can read, and yours it cannot yet. Grant access here and CloudLens gets Reader, Cost Management Reader and Cost Management Contributor, using your sign-in."
+      />
+      <CardBody>
+        <ul className="divide-y divide-border text-sm">
+          {data.subscriptions.map((s) => {
+            const outcome = outcomes[s.id];
+            return (
+              <li key={s.id} className="flex flex-wrap items-center gap-2 py-1.5">
+                {s.app_access ? <Check className="size-4 text-good" /> : <CircleAlert className="size-4 text-warn" />}
+                <span className="font-medium">{s.name ?? s.id}</span>
+                <span className="font-mono text-xs text-muted">{s.id}</span>
+                <span className="ml-auto text-xs text-muted">
+                  {s.app_access ? "CloudLens has access" : outcome && !outcome.ok ? outcome.detail || "Not granted" : "No access yet"}
+                </span>
+                {!s.app_access && s.user_access && data.can_grant && (
+                  <Button variant="primary" size="sm" disabled={busy !== null} onClick={() => grant([s.id], s.id)}>
+                    {busy === s.id ? "Granting…" : "Grant access"}
+                  </Button>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+        {lacking.length > 1 && data.can_grant && (
+          <div className="mt-3">
+            <Button variant="primary" size="sm" disabled={busy !== null} onClick={() => grant(lacking.map((s) => s.id), "all")}>
+              {busy === "all" ? "Granting…" : `Grant access to all ${lacking.length}`}
+            </Button>
+          </div>
+        )}
+        {!data.can_grant && lacking.length > 0 && (
+          <p className="mt-3 text-xs text-muted">This deployment does not know its app identity, so use the grant commands below instead.</p>
+        )}
+        {error && <p className="mt-3 text-sm text-bad">{error}</p>}
+      </CardBody>
+    </Card>
+  );
+}
+
 type AddResult = {
   subscriptions: { id: string; name?: string | null; visible: boolean; detail: string; fix: string[] }[];
   invalid: string[];
@@ -379,6 +457,14 @@ export function SetupPage() {
             </Card>
           )}
           {admin && <Blockers data={data} />}
+          {admin && data.enabled && (
+            <AppAccess
+              onDone={(message) => {
+                setNotice(message);
+                void client.invalidateQueries({ queryKey: ["setup-progress"] });
+              }}
+            />
+          )}
           {admin && data.enabled && (
             <AddSubscriptions
               onDone={(message) => {

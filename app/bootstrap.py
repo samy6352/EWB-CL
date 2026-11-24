@@ -186,6 +186,111 @@ async def plan_add_subscriptions(raw_ids: list[str]) -> dict[str, Any]:
             "script": grant_script(missing) if missing else None}
 
 
+ROLE_IDS = {
+    "Reader": "acdd72a7-3385-48ef-bd42-f606fba81ae7",
+    "Cost Management Reader": "72fafb9e-0641-4937-9268-a91bfd8191a3",
+    EXPORT_ROLE: "434105ed-43f6-452c-a2ea-5fa6d8c0f5e8",
+}
+
+
+def principal_id() -> str | None:
+    return os.getenv("CLOUDLENS_PRINCIPAL_ID") or None
+
+
+async def app_access_overview(user_subs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Every subscription the app's identity can read, plus those only the administrator can see.
+
+    Each of the administrator's subscriptions is probed live as the workload identity, so the
+    answer reflects a grant made a moment ago rather than a cached listing.
+    """
+    from . import cost
+
+    tokens = (cost._caller.set(None), cost._caller_id.set("server"))
+    try:
+        try:
+            app_subs = (await cost.list_subscriptions())["subscriptions"]
+            listing_known = True
+        except Exception as exc:  # noqa: BLE001 - the per-subscription probe below still answers
+            log.info("app subscription listing unavailable: %s", str(exc)[:200])
+            app_subs, listing_known = [], False
+        gate = asyncio.Semaphore(8)
+
+        async def probe(sub: dict[str, Any]) -> bool:
+            async with gate:
+                try:
+                    row = await cost.azure.request(
+                        "GET", f"{cost.ARM}/subscriptions/{sub['id']}",
+                        params={"api-version": cost.SUBS_API}, cache=False, attempts=1)
+                except Exception:  # noqa: BLE001 - any refusal means the app cannot read it
+                    return False
+                return row.get("state") == "Enabled"
+
+        user_rows = [{"id": s["id"].lower(), "name": s.get("name")} for s in user_subs[:200]]
+        visible = await asyncio.gather(*(probe(s) for s in user_rows))
+    finally:
+        cost._caller.reset(tokens[0])
+        cost._caller_id.reset(tokens[1])
+
+    rows: dict[str, dict[str, Any]] = {}
+    for s in app_subs:
+        rows[s["id"].lower()] = {"id": s["id"].lower(), "name": s.get("name"),
+                                 "app_access": True, "user_access": False}
+    for s, ok in zip(user_rows, visible):
+        row = rows.setdefault(s["id"], {"id": s["id"], "name": s.get("name"), "app_access": ok})
+        row.update(user_access=True, app_access=bool(row["app_access"] or ok), name=row.get("name") or s.get("name"))
+    ordered = sorted(rows.values(), key=lambda r: (r["app_access"], (r.get("name") or r["id"]).lower()))
+    return {"subscriptions": ordered, "listing_known": listing_known,
+            "can_grant": principal_id() is not None, "roles": list(ROLE_IDS)}
+
+
+async def grant_app_access(ids: list[str]) -> list[dict[str, Any]]:
+    """Give the app's identity the roles it needs, using the signed-in administrator's own token.
+
+    Call inside `as_user`. Azure decides whether that person may assign roles on each
+    subscription, so a refusal is reported per subscription instead of being second-guessed here.
+    The assignment name is derived from subscription, identity and role, which makes a repeat a
+    no-op rather than a duplicate.
+    """
+    import uuid
+
+    from . import cost
+
+    require_writable()
+    pid = principal_id()
+    if not pid:
+        raise ValueError("This deployment does not know its app identity (CLOUDLENS_PRINCIPAL_ID is not set); "
+                         "use the grant commands instead.")
+    out: list[dict[str, Any]] = []
+    for sub in dict.fromkeys(i.strip().lower() for i in ids):
+        if not _GUID.match(sub):
+            out.append({"id": sub, "ok": False, "roles": {}, "detail": "Not a valid subscription ID."})
+            continue
+        roles: dict[str, str] = {}
+        for role, role_id in ROLE_IDS.items():
+            name = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{sub}|{pid}|{role_id}"))
+            url = f"{cost.ARM}/subscriptions/{sub}/providers/Microsoft.Authorization/roleAssignments/{name}"
+            body = {"properties": {
+                "roleDefinitionId": f"/subscriptions/{sub}/providers/Microsoft.Authorization/roleDefinitions/{role_id}",
+                "principalId": pid, "principalType": "ServicePrincipal"}}
+            try:
+                await cost.azure.request("PUT", url, json_body=body,
+                                         params={"api-version": cost.ROLE_API}, cache=False, attempts=2)
+                roles[role] = "granted"
+            except Exception as exc:  # noqa: BLE001 - reported per role
+                text = str(exc)
+                if "RoleAssignmentExists" in text or "409" in text:
+                    roles[role] = "already granted"
+                elif "AuthorizationFailed" in text or "403" in text:
+                    roles[role] = "denied"
+                else:
+                    roles[role] = f"failed: {text[:160]}"
+        ok = all(v in {"granted", "already granted"} for v in roles.values())
+        detail = "" if ok else ("You need Owner, User Access Administrator or RBAC Administrator on this "
+                                "subscription to grant access." if "denied" in roles.values() else "Some roles could not be assigned.")
+        out.append({"id": sub, "ok": ok, "roles": roles, "detail": detail})
+    return out
+
+
 # ------------------------------------------------------------------ lease and status
 def _claim(owner: str) -> bool:
     with jobs.transaction() as con:
