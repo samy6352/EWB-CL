@@ -22,6 +22,34 @@ param namePrefix string = 'cloudlens'
 @maxLength(10)
 param nameSuffix string = ''
 
+@description('Exact web app name (2-60 letters, digits, hyphens). Empty derives it from namePrefix/nameSuffix.')
+@maxLength(60)
+param webAppNameOverride string = ''
+@description('Exact PostgreSQL server name (3-63 lower-case letters, digits, hyphens).')
+@maxLength(63)
+param postgresNameOverride string = ''
+@description('Exact application database name. Empty keeps cloudlens.')
+@maxLength(63)
+param databaseNameOverride string = ''
+@description('Exact user-assigned managed identity name.')
+@maxLength(128)
+param identityNameOverride string = ''
+@description('Exact Foundry (AI Services) account name (2-64 letters, digits, hyphens).')
+@maxLength(64)
+param foundryNameOverride string = ''
+@description('Exact App Service plan name.')
+@maxLength(60)
+param planNameOverride string = ''
+@description('Exact Log Analytics workspace name.')
+@maxLength(63)
+param workspaceNameOverride string = ''
+@description('Exact Application Insights name.')
+@maxLength(260)
+param insightsNameOverride string = ''
+@description('Exact application storage container name (3-63 lower-case letters, digits, hyphens). Empty keeps cloudlens.')
+@maxLength(63)
+param archiveContainerNameOverride string = ''
+
 @description('Reviewed, stable export storage account name (3-24 lowercase letters/digits). Required: for a new deployment generate a random name once and save it in the parameters; for redeployment use the actual existing account, never a newly generated name. deploy.ps1 generates/persists or adopts this value.')
 @minLength(3)
 @maxLength(24)
@@ -180,6 +208,15 @@ module stack 'modules/stack.bicep' = {
     location: location
     namePrefix: namePrefix
     nameSuffix: nameSuffix
+    webAppNameOverride: webAppNameOverride
+    postgresNameOverride: postgresNameOverride
+    databaseNameOverride: databaseNameOverride
+    identityNameOverride: identityNameOverride
+    foundryNameOverride: foundryNameOverride
+    planNameOverride: planNameOverride
+    workspaceNameOverride: workspaceNameOverride
+    insightsNameOverride: insightsNameOverride
+    archiveContainerNameOverride: archiveContainerNameOverride
     storageAccountName: storageAccountName
     adminPrincipalObjectId: adminPrincipalObjectId
     adminPrincipalName: adminPrincipalName

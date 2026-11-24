@@ -77,6 +77,18 @@ param(
     [string]$NamePrefix = '',
     [string]$NameSuffix = '',
 
+    # Exact resource names (your naming convention); empty keeps the derived name.
+    [string]$WebAppName = '',
+    [string]$PostgresServerName = '',
+    [string]$DatabaseName = '',
+    [string]$ManagedIdentityName = '',
+    [string]$FoundryAccountName = '',
+    [string]$AppServicePlanName = '',
+    [string]$LogAnalyticsName = '',
+    [string]$AppInsightsName = '',
+    [string]$StorageContainerName = '',
+    [string]$StorageAccountName = '',
+
     # Current month counts as one. Earlier history remains an explicit administrator choice.
     [ValidateRange(1, 13)]
     [int]$InitialHistoryMonths = 3,
@@ -243,7 +255,8 @@ function Get-CloudLensExistingSite([string]$Group) {
     if ($exists -ne 'true') { return $null }
     $found = @(Invoke-Az @('webapp', 'list', '--resource-group', $Group,
         '--query', "[?tags.application=='CloudLens'].{name:name,host:defaultHostName}"))
-    if ($NamePrefix) { $found = @($found | Where-Object { $_.name -eq "$NamePrefix-web-$NameSuffix" }) }
+    if ($WebAppName) { $found = @($found | Where-Object { $_.name -eq $WebAppName }) }
+    elseif ($NamePrefix) { $found = @($found | Where-Object { $_.name -eq "$NamePrefix-web-$NameSuffix" }) }
     if ($found.Count -gt 1) {
         throw "$($found.Count) CloudLens apps exist in $Group ($(($found | ForEach-Object { $_.name }) -join ', ')). Pass -NamePrefix and -NameSuffix to choose one. Nothing has been changed."
     }
@@ -343,7 +356,8 @@ if ($interactive) {
 if (-not $Location) { throw '-Location is required when not running in a terminal. Nothing has been changed.' }
 $PrefixRule = '^[a-z0-9][a-z0-9-]{0,10}[a-z0-9]$'  # 2-12, as main.bicep allows
 $SuffixRule = '^[a-z0-9]([a-z0-9-]{0,8}[a-z0-9])?$'  # 1-10
-if ($interactive -and -not $NamePrefix -and -not $NameSuffix) {
+$namedExplicitly = [bool]($WebAppName -or $PostgresServerName -or $FoundryAccountName -or $ManagedIdentityName)
+if ($interactive -and -not $NamePrefix -and -not $NameSuffix -and -not $namedExplicitly) {
     Write-Host "`nResource names: {name}-web-{suffix}, {name}-postgres-{suffix}, and so on."
     Write-Host 'Press Enter at both questions to keep the generated default names.'
     $NamePrefix = (Read-Host 'Application name, 2-12 characters, e.g. cloudlens').Trim().ToLowerInvariant()
@@ -547,6 +561,10 @@ foreach ($key in @('VnetAddressPrefix', 'AppSubnetAddressPrefix', 'PostgresSubne
 }
 if ($NamePrefix) { $deploy.NamePrefix = $NamePrefix }
 if ($NameSuffix) { $deploy.NameSuffix = $NameSuffix }
+foreach ($key in @('WebAppName', 'PostgresServerName', 'DatabaseName', 'ManagedIdentityName', 'FoundryAccountName', 'AppServicePlanName', 'LogAnalyticsName', 'AppInsightsName', 'StorageContainerName', 'StorageAccountName')) {
+    $value = (Get-Variable -Name $key -ValueOnly)
+    if ($value) { $deploy[$key] = $value }
+}
 $localPassword = $null
 if ($LocalSignIn) {
     $deploy.SkipEntra = $true

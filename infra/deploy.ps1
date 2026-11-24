@@ -27,6 +27,17 @@ param(
     [string]$NamePrefix = 'cloudlens',
     [string]$NameSuffix = '',
 
+    # Exact names that override the derived ones (your naming convention). Empty keeps the default.
+    [string]$WebAppName = '',
+    [string]$PostgresServerName = '',
+    [string]$DatabaseName = '',
+    [string]$ManagedIdentityName = '',
+    [string]$FoundryAccountName = '',
+    [string]$AppServicePlanName = '',
+    [string]$LogAnalyticsName = '',
+    [string]$AppInsightsName = '',
+    [string]$StorageContainerName = '',
+
     # Optional reviewed legacy name. Existing configured storage is always preserved.
     [string]$StorageAccountName = '',
 
@@ -201,6 +212,23 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+$nameRules = [ordered]@{
+    WebAppName           = @{ Pattern = '^[A-Za-z0-9]([A-Za-z0-9-]{0,58}[A-Za-z0-9])?$'; Rule = '1-60 letters, digits or hyphens, not starting or ending with a hyphen' }
+    PostgresServerName   = @{ Pattern = '^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])$'; Rule = '3-63 lower-case letters, digits or hyphens, not starting or ending with a hyphen' }
+    DatabaseName         = @{ Pattern = '^[A-Za-z_][A-Za-z0-9_-]{0,62}$'; Rule = '1-63 letters, digits, underscores or hyphens, starting with a letter or underscore' }
+    ManagedIdentityName  = @{ Pattern = '^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$'; Rule = '3-128 letters, digits, hyphens or underscores' }
+    FoundryAccountName   = @{ Pattern = '^[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])$'; Rule = '2-64 letters, digits or hyphens, not starting or ending with a hyphen' }
+    AppServicePlanName   = @{ Pattern = '^[A-Za-z0-9]([A-Za-z0-9-]{0,58}[A-Za-z0-9])?$'; Rule = '1-60 letters, digits or hyphens' }
+    LogAnalyticsName     = @{ Pattern = '^[A-Za-z0-9]([A-Za-z0-9-]{2,61}[A-Za-z0-9])$'; Rule = '4-63 letters, digits or hyphens, not starting or ending with a hyphen' }
+    AppInsightsName      = @{ Pattern = '^[^%&\\?/]{1,260}$'; Rule = '1-260 characters without % & \ ? /' }
+    StorageContainerName = @{ Pattern = '^[a-z0-9]([a-z0-9]|-(?!-)){1,61}[a-z0-9]$'; Rule = '3-63 lower-case letters, digits or single hyphens, starting and ending with a letter or digit' }
+}
+foreach ($key in $nameRules.Keys) {
+    $value = (Get-Variable -Name $key -ValueOnly)
+    if ($value -and $value -cnotmatch $nameRules[$key].Pattern) {
+        throw "-$key '$value' is not valid: use $($nameRules[$key].Rule). Nothing has been changed."
+    }
+}
 if ($ManagedExports -and -not $EnableExportManagement) {
     throw '-ManagedExports needs -EnableExportManagement: the app creates and runs exports with Cost Management Contributor.'
 }
@@ -538,10 +566,11 @@ $StorageAccountName = Get-CloudLensStorageAccountName -SubscriptionId $account.i
 # just this subscription. Checked here because the alternative is a partial
 # deployment: ARM creates the identity, the VNet and the workspace, then fails on
 # the name and leaves the resource group half-built.
-if ($NameSuffix) {
+$postgresCandidate = if ($PostgresServerName) { $PostgresServerName } elseif ($NameSuffix) { "$($NamePrefix.ToLower())-postgres-$($NameSuffix.ToLower())" } else { '' }
+$webCandidate = if ($WebAppName) { $WebAppName } elseif ($NameSuffix) { "$NamePrefix-web-$NameSuffix" } else { '' }
+$foundryCandidate = if ($FoundryAccountName) { $FoundryAccountName } elseif ($NameSuffix) { "$NamePrefix-aif-$NameSuffix" } else { '' }
+if ($postgresCandidate -or $webCandidate -or $foundryCandidate) {
     Step 'Checking globally-unique names are free'
-    $postgresCandidate = "$($NamePrefix.ToLower())-postgres-$($NameSuffix.ToLower())"
-    $webCandidate = "$NamePrefix-web-$NameSuffix"
 
     # The request body goes via a file rather than an inline argument. A JSON string
     # containing double quotes does not survive PowerShell's native-command argument
@@ -562,7 +591,8 @@ if ($NameSuffix) {
     $results = @(
         @{ Kind = 'PostgreSQL server'; Name = $postgresCandidate; Type = 'Microsoft.DBforPostgreSQL/flexibleServers' }
         @{ Kind = 'Web app'; Name = $webCandidate; Type = 'Microsoft.Web/sites' }
-    )
+        @{ Kind = 'Foundry account'; Name = $foundryCandidate; Type = 'Microsoft.CognitiveServices/accounts' }
+    ) | Where-Object { $_.Name }
 
     $taken = @()
     foreach ($item in $results) {
@@ -586,6 +616,11 @@ if ($NameSuffix) {
                 Test-AzureName -Url "https://management.azure.com/subscriptions/$($account.id)/providers/Microsoft.Web/checknameavailability?api-version=2023-12-01" `
                                -Body @{ name = $item.Name; type = 'Site' }
             }
+            'Foundry account' {
+                $domain = Test-AzureName -Url "https://management.azure.com/subscriptions/$($account.id)/providers/Microsoft.CognitiveServices/checkDomainAvailability?api-version=2023-05-01" `
+                                         -Body @{ subdomainName = $item.Name; type = 'Microsoft.CognitiveServices/accounts' }
+                [pscustomobject]@{ nameAvailable = [bool]$domain.isSubdomainAvailable; reason = $domain.reason; message = $domain.message }
+            }
         }
 
         if ($result.nameAvailable) {
@@ -600,7 +635,7 @@ if ($NameSuffix) {
     if ($taken.Count) {
         throw ("These names are taken elsewhere in Azure, or are invalid: " +
                ($taken -join ', ') +
-               ". Choose a different -NameSuffix or -NamePrefix; nothing has been created.")
+               ". Choose different names; nothing has been created.")
     }
 }
 
@@ -676,6 +711,15 @@ $templateParameters = @(
     "resourceGroupName=$ResourceGroup"
     "namePrefix=$NamePrefix"
     "nameSuffix=$NameSuffix"
+    "webAppNameOverride=$WebAppName"
+    "postgresNameOverride=$PostgresServerName"
+    "databaseNameOverride=$DatabaseName"
+    "identityNameOverride=$ManagedIdentityName"
+    "foundryNameOverride=$FoundryAccountName"
+    "planNameOverride=$AppServicePlanName"
+    "workspaceNameOverride=$LogAnalyticsName"
+    "insightsNameOverride=$AppInsightsName"
+    "archiveContainerNameOverride=$StorageContainerName"
     "storageAccountName=$StorageAccountName"
     "adminPrincipalObjectId=$adminObjectId"
     "adminPrincipalName=$adminName"

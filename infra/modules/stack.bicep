@@ -21,6 +21,25 @@ param namePrefix string
 @description('Optional environment token appended to resource names other than storage. Empty keeps the default CAF naming (id-cloudlens); setting it brackets the type abbreviation instead (CL-id-prod). PostgreSQL is folded to lower case.')
 param nameSuffix string = ''
 
+@description('Exact web app name. Empty derives it from namePrefix/nameSuffix.')
+param webAppNameOverride string = ''
+@description('Exact PostgreSQL server name (lower case). Empty derives it from namePrefix/nameSuffix.')
+param postgresNameOverride string = ''
+@description('Exact application database name. Empty keeps cloudlens.')
+param databaseNameOverride string = ''
+@description('Exact user-assigned managed identity name. Empty derives it from namePrefix/nameSuffix.')
+param identityNameOverride string = ''
+@description('Exact Foundry (AI Services) account name. Empty derives it from namePrefix/nameSuffix.')
+param foundryNameOverride string = ''
+@description('Exact App Service plan name. Empty derives it from namePrefix/nameSuffix.')
+param planNameOverride string = ''
+@description('Exact Log Analytics workspace name. Empty derives it from namePrefix/nameSuffix.')
+param workspaceNameOverride string = ''
+@description('Exact Application Insights name. Empty derives it from namePrefix/nameSuffix.')
+param insightsNameOverride string = ''
+@description('Exact name of the application storage container. Empty keeps cloudlens.')
+param archiveContainerNameOverride string = ''
+
 @description('Stable, reviewed export storage name. Generate once for a new deployment; preserve the actual account name on redeployment.')
 @minLength(3)
 @maxLength(24)
@@ -175,16 +194,17 @@ var suffix = substring(uniqueString(resourceGroup().id), 0, 5)
 // tenant already holds. deploy.ps1 checks availability before it provisions.
 var bracketed = !empty(nameSuffix)
 
-var identityName = bracketed ? '${namePrefix}-id-${nameSuffix}' : 'id-${namePrefix}'
-var workspaceName = bracketed ? '${namePrefix}-log-${nameSuffix}' : 'log-${namePrefix}'
-var insightsName = bracketed ? '${namePrefix}-appi-${nameSuffix}' : 'appi-${namePrefix}'
-var postgresName = bracketed ? toLower('${namePrefix}-postgres-${nameSuffix}') : '${namePrefix}-pg-${suffix}'
-var planName = bracketed ? '${namePrefix}-plan-${nameSuffix}' : 'plan-${namePrefix}'
-var webAppName = bracketed ? '${namePrefix}-web-${nameSuffix}' : '${namePrefix}-${suffix}'
+var identityName = !empty(identityNameOverride) ? identityNameOverride : (bracketed ? '${namePrefix}-id-${nameSuffix}' : 'id-${namePrefix}')
+var workspaceName = !empty(workspaceNameOverride) ? workspaceNameOverride : (bracketed ? '${namePrefix}-log-${nameSuffix}' : 'log-${namePrefix}')
+var insightsName = !empty(insightsNameOverride) ? insightsNameOverride : (bracketed ? '${namePrefix}-appi-${nameSuffix}' : 'appi-${namePrefix}')
+var postgresName = !empty(postgresNameOverride) ? toLower(postgresNameOverride) : (bracketed ? toLower('${namePrefix}-postgres-${nameSuffix}') : '${namePrefix}-pg-${suffix}')
+var planName = !empty(planNameOverride) ? planNameOverride : (bracketed ? '${namePrefix}-plan-${nameSuffix}' : 'plan-${namePrefix}')
+var webAppName = !empty(webAppNameOverride) ? webAppNameOverride : (bracketed ? '${namePrefix}-web-${nameSuffix}' : '${namePrefix}-${suffix}')
 var vnetName = bracketed ? '${namePrefix}-vnet-${nameSuffix}' : 'vnet-${namePrefix}'
-var foundryName = bracketed ? '${namePrefix}-aif-${nameSuffix}' : 'aif-${namePrefix}-${suffix}'
+var foundryName = !empty(foundryNameOverride) ? foundryNameOverride : (bracketed ? '${namePrefix}-aif-${nameSuffix}' : 'aif-${namePrefix}-${suffix}')
 var projectName = bracketed ? '${namePrefix}-proj-${nameSuffix}' : 'proj-${namePrefix}'
-var databaseName = 'cloudlens'
+var databaseName = !empty(databaseNameOverride) ? databaseNameOverride : 'cloudlens'
+var archiveContainerName = !empty(archiveContainerNameOverride) ? archiveContainerNameOverride : 'cloudlens'
 
 var postgresDnsZoneName = '${postgresName}.private.postgres.database.azure.com'
 var blobDnsZoneName = 'privatelink.blob.${environment().suffixes.storage}'
@@ -372,7 +392,7 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01'
 
 resource exportsContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   parent: blobService
-  name: 'cloudlens'
+  name: archiveContainerName
   properties: {
     publicAccess: 'None'
   }
