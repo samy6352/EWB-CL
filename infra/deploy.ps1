@@ -241,13 +241,20 @@ if (-not $script:InstallStart) {
 }
 $script:StepPrefix = if ($env:CLOUDLENS_PARENT_STEP) { "$($env:CLOUDLENS_PARENT_STEP)." } else { '' }
 $script:StepNumber = 0
+$uiScript = Join-Path $PSScriptRoot 'ui.ps1'
+if (Test-Path -LiteralPath $uiScript) { . $uiScript } else { $script:UiFancy = $false }
 function Get-ElapsedText { $e = [datetime]::UtcNow - $script:InstallStart; '{0:00}:{1:00}' -f [int][math]::Floor($e.TotalMinutes), $e.Seconds }
 
 function Step($message) {
     $script:StepNumber++
-    Write-Host ""
-    Write-Host "==> [$(Get-ElapsedText)] Step $($script:StepPrefix)$($script:StepNumber): $message" -ForegroundColor Cyan
-    Write-Progress -Activity 'CloudLens deployment' -Status "Step $($script:StepNumber): $message" -PercentComplete ([math]::Min(95, $script:StepNumber * 7))
+    $percent = [math]::Min(95, $script:StepNumber * 7)
+    if ($script:UiFancy) {
+        Write-UiStep -Title $message -Label "Deploy $($script:StepPrefix)$($script:StepNumber)" -Percent $percent -Elapsed (Get-ElapsedText)
+    } else {
+        Write-Host ""
+        Write-Host "==> [$(Get-ElapsedText)] Step $($script:StepPrefix)$($script:StepNumber): $message" -ForegroundColor Cyan
+    }
+    Write-Progress -Activity 'CloudLens deployment' -Status "Step $($script:StepNumber): $message" -PercentComplete $percent
 }
 
 function Wait-CloudLensInfrastructure([string]$Name, [string]$Group, [hashtable]$Baseline = @{}) {
@@ -263,14 +270,25 @@ function Wait-CloudLensInfrastructure([string]$Name, [string]$Group, [hashtable]
                 if (-not $seen.ContainsKey($key)) {
                     $seen[$key] = $true
                     if ($Baseline.ContainsKey($key)) { continue }
-                    Write-Host ("    [{0}] new        {1,-45} {2}" -f (Get-ElapsedText), $r[0], $r[1])
+                    if ($script:UiFancy) {
+                        Write-Host '     + ' -ForegroundColor Green -NoNewline
+                        Write-Host ("{0,-46}" -f ($r[0] -replace '^Microsoft\.', '')) -ForegroundColor DarkGray -NoNewline
+                        Write-Host (" {0}  [{1}]" -f $r[1], (Get-ElapsedText))
+                    } else {
+                        Write-Host ("    [{0}] new        {1,-45} {2}" -f (Get-ElapsedText), $r[0], $r[1])
+                    }
                 }
             }
         }
         $state = az deployment sub show --name $Name --query properties.provisioningState -o tsv --only-show-errors 2>$null
         if ($state -in 'Succeeded', 'Failed', 'Canceled') { break }
         if (((Get-Date) - $lastBeat).TotalSeconds -ge 60) {
-            Write-Host ("    [{0}] still deploying ({1} new resources so far, state {2})" -f (Get-ElapsedText), ($seen.Count - $existing), $(if ($state) { $state } else { 'Starting' }))
+            $stateText = $(if ($state) { $state } else { 'Starting' })
+            if ($script:UiFancy) {
+                Write-UiStatus info ("… still deploying · {0} new resources · {1} · {2}" -f ($seen.Count - $existing), $stateText, (Get-ElapsedText))
+            } else {
+                Write-Host ("    [{0}] still deploying ({1} new resources so far, state {2})" -f (Get-ElapsedText), ($seen.Count - $existing), $stateText)
+            }
             $lastBeat = Get-Date
         }
         Write-Progress -Activity 'CloudLens deployment' -Status "Provisioning infrastructure: $($seen.Count - $existing) new resources" -PercentComplete ([math]::Min(60, 20 + $seen.Count - $existing))
@@ -286,7 +304,11 @@ function Wait-CloudLensInfrastructure([string]$Name, [string]$Group, [hashtable]
         }
         throw "Provisioning the infrastructure ended as $state. $detail$opsText"
     }
-    Write-Host ("    [{0}] infrastructure ready ({1} resources in the group, {2} new)" -f (Get-ElapsedText), $seen.Count, ($seen.Count - $existing)) -ForegroundColor Green
+    if ($script:UiFancy) {
+        Write-UiStatus ok ("Infrastructure ready · {0} resources in the group, {1} new · {2}" -f $seen.Count, ($seen.Count - $existing), (Get-ElapsedText))
+    } else {
+        Write-Host ("    [{0}] infrastructure ready ({1} resources in the group, {2} new)" -f (Get-ElapsedText), $seen.Count, ($seen.Count - $existing)) -ForegroundColor Green
+    }
 }
 
 function Get-CloudLensFailedDeploymentOperations([string]$DeploymentName, [string]$ResourceGroup) {

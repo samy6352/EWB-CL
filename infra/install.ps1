@@ -123,6 +123,12 @@ if ($AppIdentityOnly -and $RequireDelegatedArm) {
     throw '-AppIdentityOnly cannot be combined with -RequireDelegatedArm.'
 }
 $started = Get-Date
+$uiScript = Join-Path $PSScriptRoot 'ui.ps1'
+if (Test-Path -LiteralPath $uiScript) { . $uiScript } else { $script:UiFancy = $false }
+if ($script:UiFancy -and -not $env:CLOUDLENS_BANNER_SHOWN) {
+    Show-UiBanner 'Guided installer'
+    $env:CLOUDLENS_BANNER_SHOWN = '1'
+}
 
 $Profiles = [ordered]@{
     # Plan section 9. Small stays on General Purpose until the burstable backfill spike (S5) says otherwise.
@@ -144,9 +150,15 @@ $script:StepNumber = 0
 function Step([string]$Message) {
     $script:StepNumber++
     $e = (Get-Date) - $started
-    Write-Host ''
-    Write-Host ("==> [{0:00}:{1:00}] Step {2}: {3}" -f [int][math]::Floor($e.TotalMinutes), $e.Seconds, $script:StepNumber, $Message) -ForegroundColor Cyan
-    Write-Progress -Activity 'CloudLens install' -Status $Message -PercentComplete ([math]::Min(95, $script:StepNumber * 10))
+    $elapsedText = '{0:00}:{1:00}' -f [int][math]::Floor($e.TotalMinutes), $e.Seconds
+    $percent = [math]::Min(95, $script:StepNumber * 10)
+    if ($script:UiFancy) {
+        Write-UiStep -Title $Message -Label "Step $($script:StepNumber)" -Percent $percent -Elapsed $elapsedText
+    } else {
+        Write-Host ''
+        Write-Host ("==> [{0}] Step {1}: {2}" -f $elapsedText, $script:StepNumber, $Message) -ForegroundColor Cyan
+    }
+    Write-Progress -Activity 'CloudLens install' -Status $Message -PercentComplete $percent
 }
 function Info([string]$Message) { Write-Host "    $Message" }
 
@@ -616,10 +628,15 @@ if ($site -and $env:CLOUDLENS_WEBAPP_NAME) {
 $elapsed = (Get-Date) - $started
 Step "Installation handoff ($([int][math]::Floor($elapsed.TotalMinutes)) min $($elapsed.Seconds) s)"
 if ($site) {
-    Write-Host "    Open CloudLens: https://$($site.host)" -ForegroundColor Green
-    Info "Track exports and first import: https://$($site.host)/v2/admin/setup"
+    if ($script:UiFancy) {
+        Show-UiSuccess -Url "https://$($site.host)" -SetupUrl "https://$($site.host)/v2/admin/setup" `
+            -Monitoring "$($target.Path)" -Elapsed "$([int][math]::Floor($elapsed.TotalMinutes)) min $($elapsed.Seconds) s"
+    } else {
+        Write-Host "    Open CloudLens: https://$($site.host)" -ForegroundColor Green
+        Info "Track exports and first import: https://$($site.host)/v2/admin/setup"
+    }
 }
-Info "Monitoring   : $($target.Path)"
+if (-not $script:UiFancy) { Info "Monitoring   : $($target.Path)" }
 if ($exportsPartial) { Write-Warning 'Installed, but some subscriptions still need a role grant or export from someone with access there (commands are printed above and on the Setup page). Re-run this installer or infra\add-subscriptions.ps1 afterwards.' }
 Info 'App installation and billing data readiness are separate. First cost data usually arrives within a few hours; a brand-new export can take up to 24 h.'
 if ($env:CLOUDLENS_PENDING_CONSENT_APP) {

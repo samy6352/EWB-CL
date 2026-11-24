@@ -109,7 +109,7 @@ if ($InstallerSource) {
         'tools/package.ps1', 'tools/validate_package.py', 'tools/verify_package.py', 'tools/start_local.py',
         'tools/install-customer.ps1',
         'infra/README.md', 'infra/CUSTOMER-DEPLOYMENT.md', 'infra/install.ps1', 'infra/deploy.ps1',
-        'infra/add-subscriptions.ps1', 'infra/onboard-subscriptions.ps1',
+        'infra/add-subscriptions.ps1', 'infra/onboard-subscriptions.ps1', 'infra/ui.ps1',
         'infra/preflight.ps1', 'infra/deployment-checks.ps1', 'infra/install-prerequisites.ps1',
         'infra/cost-access.ps1', 'infra/storage-naming.ps1',
         'infra/focus-exports.ps1', 'infra/grant-cost-access.ps1',

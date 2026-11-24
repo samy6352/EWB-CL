@@ -62,19 +62,22 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'deployment-checks.ps1')
+$uiScript = Join-Path $PSScriptRoot 'ui.ps1'
+if (Test-Path -LiteralPath $uiScript) { . $uiScript } else { $script:UiFancy = $false }
 
 $script:Blockers = @()
 $script:Warnings = @()
 
 function Section($text) {
+    if ($script:UiFancy) { Write-UiSection $text; return }
     Write-Host ""
     Write-Host "== $text" -ForegroundColor Cyan
 }
 
-function Ok($text)   { Write-Host "   [ok]    $text" -ForegroundColor Green }
-function Warn($text) { Write-Host "   [warn]  $text" -ForegroundColor Yellow; $script:Warnings += $text }
-function Bad($text)  { Write-Host "   [BLOCK] $text" -ForegroundColor Red;   $script:Blockers += $text }
-function Info($text) { Write-Host "           $text" -ForegroundColor DarkGray }
+function Ok($text)   { if ($script:UiFancy) { Write-UiStatus ok $text } else { Write-Host "   [ok]    $text" -ForegroundColor Green } }
+function Warn($text) { if ($script:UiFancy) { Write-UiStatus warn $text } else { Write-Host "   [warn]  $text" -ForegroundColor Yellow }; $script:Warnings += $text }
+function Bad($text)  { if ($script:UiFancy) { Write-UiStatus bad $text } else { Write-Host "   [BLOCK] $text" -ForegroundColor Red };   $script:Blockers += $text }
+function Info($text) { if ($script:UiFancy) { Write-UiStatus info $text } else { Write-Host "           $text" -ForegroundColor DarkGray } }
 
 # ----------------------------------------------------------------- identity
 
