@@ -106,7 +106,11 @@ be in one VNet in the deployment region, and CloudLens does not change that
 VNet. The app subnet must be delegated to `Microsoft.Web/serverFarms` (/28 or
 larger), the PostgreSQL subnet to `Microsoft.DBforPostgreSQL/flexibleServers`
 (/28 or larger, no other resources), and the private endpoint subnet must be
-undelegated. The installer checks all of this before provisioning. The
+undelegated. The installer checks all of this before provisioning, and adds the
+missing app and PostgreSQL delegations itself to a subnet that has none (it
+never replaces another service's delegation). That one change needs
+`Microsoft.Network/virtualNetworks/subnets/write` on the subnets; without it
+the installer stops and prints the command for the network team. The
 deploying account needs `Microsoft.Network/virtualNetworks/subnets/join/action`
 on the subnets and rights to link private DNS zones to the VNet (for example
 Network Contributor on it). CloudLens creates its own private DNS zones and

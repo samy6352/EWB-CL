@@ -611,7 +611,20 @@ if ($useExistingNetwork) {
         }
         $delegations = @($subnet.delegations | ForEach-Object { $_.serviceName })
         if ($entry.Delegation -and ($delegations -notcontains $entry.Delegation)) {
-            throw "$($entry.Label) subnet must be delegated to $($entry.Delegation). Add the delegation in the portal or with: az network vnet subnet update --ids '$($entry.Id)' --delegations $($entry.Delegation)"
+            $manualFix = "Add the delegation in the portal or with: az network vnet subnet update --ids '$($entry.Id)' --delegations $($entry.Delegation)"
+            # Only add a delegation to a subnet that has none; never replace another service's delegation.
+            if ($delegations.Count -gt 0) {
+                throw "$($entry.Label) subnet is delegated to $($delegations -join ', ') but must be delegated to $($entry.Delegation). Use a different subnet."
+            }
+            Write-Host "    $($entry.Label) subnet has no delegation; adding $($entry.Delegation)..."
+            $updated = az network vnet subnet update --ids $entry.Id --delegations $entry.Delegation -o json 2>&1
+            $updatedSubnet = $null
+            if ($LASTEXITCODE -eq 0) { $updatedSubnet = $updated | ConvertFrom-Json }
+            if (-not $updatedSubnet -or (@($updatedSubnet.delegations | ForEach-Object { $_.serviceName }) -notcontains $entry.Delegation)) {
+                throw "$($entry.Label) subnet must be delegated to $($entry.Delegation) and the installer could not add it (needs Microsoft.Network/virtualNetworks/subnets/write on the VNet, and the subnet must hold no other resources). $manualFix"
+            }
+            Write-Host "    delegated $($entry.Label) subnet to $($entry.Delegation)"
+            $subnet = $updatedSubnet
         }
         if (-not $entry.Delegation -and $delegations.Count -gt 0) {
             throw "Private endpoint subnet is delegated to $($delegations -join ', '); private endpoints need an undelegated subnet."
