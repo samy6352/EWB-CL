@@ -417,7 +417,9 @@ async def run_once() -> dict[str, Any]:
         stalled: dict[str, list[dict]] = {}
         for s in managed:
             config = configs[s["id"]]
-            if config.get("enabled") or s["id"] in busy or not config.get("setup_job"):
+            # A subscription inside a job that is still running is not skipped: its own failed
+            # `configure` task can be waiting on an export that now exists (handled below).
+            if config.get("enabled") or not config.get("setup_job"):
                 continue
             job = await asyncio.to_thread(jobs.get, config["setup_job"])
             task = next((t for t in (job or {}).get("tasks", []) if t["subscription"] == s["id"]
@@ -429,8 +431,21 @@ async def run_once() -> dict[str, Any]:
                     "fix": schedules.operator_command(s["id"]),
                 }]
                 # A job still working on other subscriptions keeps going; retry once it settles.
+                # Exception: the operator has since created this subscription's export. Waiting
+                # for a settle would hold it behind other subscriptions' Azure report generation,
+                # which can take hours, so retry it now.
                 if job["status"] in jobs.TERMINAL:
                     stalled.setdefault(job["job_id"], []).append(s)
+                else:
+                    from . import focus_sync
+
+                    try:
+                        export_exists = bool(await focus_sync.owned([s["id"]], fresh=True))
+                    except Exception as exc:  # noqa: BLE001 - a failed lookup just means wait
+                        log.info("managed exports: owned-export lookup failed for %s: %s", s["id"], str(exc)[:200])
+                        export_exists = False
+                    if export_exists:
+                        stalled.setdefault(job["job_id"], []).append(s)
         for job_id in stalled:
             focus_workflow.launch(await focus_workflow.resume(job_id))
             result["resumed"].append(job_id)

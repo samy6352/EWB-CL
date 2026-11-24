@@ -589,3 +589,26 @@ def test_an_export_the_app_may_not_create_is_created_by_an_operator_and_then_ado
     fourth = asyncio.run(bootstrap.run_once())
     # Only S4's genuinely missing export role remains; nothing is resumed again.
     assert set(fourth["blockers"]) == {S4} and fourth["resumed"] == []
+
+
+def test_a_failed_export_is_retried_while_the_job_still_waits_on_azure(azure, monkeypatch):
+    """Found on a fresh install: the installer created the export just after setup first tried.
+
+    Other subscriptions' Azure reports take hours, so waiting for the job to settle would leave
+    this one failed that long. Once its export exists it is retried straight away.
+    """
+    from app import bootstrap, schedules
+
+    azure.arm.deny_writes = True
+    job_id = asyncio.run(bootstrap.run_once())["job_id"]
+    asyncio.run(azure.jobs.run(job_id, lambda: azure.flow.step(job_id)))
+    azure.jobs.update(job_id, status="waiting-for-Azure")
+
+    assert asyncio.run(bootstrap.run_once())["resumed"] == []  # no export yet: keep waiting
+
+    for sub in (S1, S3, S5):
+        name = schedules.export_name("FocusCost", **schedules.destination(sub))
+        body = schedules._body("FocusCost", ACCOUNT, "focus-exports", f"focus/{sub}")
+        body["properties"]["schedule"]["status"] = "Active"
+        azure.arm.exports.setdefault(sub, {})[name] = {**body, "name": name, "eTag": "op1"}
+    assert asyncio.run(bootstrap.run_once())["resumed"] == [job_id]
