@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { launchNativeBrowser, nativeTestCleanup } from "./tests/native-test-cleanup";
-import type { Browser } from "playwright";
+import type { Browser, Page } from "playwright";
 import { createServer, type ViteDevServer } from "vite";
 import { ADVISOR_PILLARS } from "./advisor-score";
 
@@ -27,6 +27,15 @@ const report = (scope: string | null) => ({
   partial: scope === second, errors: scope === second ? [{ subscription_id: second, message: "Advisor permission denied" }] : [],
   aggregation: "unweighted_mean", note: "Latest evidence",
 });
+const advisorRecommendations = {
+  category: "All", count: 3, distinct_count: 3, currency: "USD", estimated_annual_savings: 120, annual_savings_by_currency: { USD: 120 },
+  recommendations: [
+    { id: "r1", category: "Cost", impact: "Medium", problem: "Right-size underutilized virtual machines", solution: "Resize", resource: "vm-one", resourceGroup: "rg-a", subscriptionId: first, annual_savings: 120, currency: "USD" },
+    { id: "r2", category: "Security", impact: "High", problem: "Enable MFA for accounts with owner permissions", solution: "Enable MFA", resource: "sub-owner", resourceGroup: null, subscriptionId: first, annual_savings: null, currency: null },
+    { id: "r3", category: "HighAvailability", impact: "Low", problem: "Enable zone redundancy", solution: "Redeploy", resource: "plan-a", resourceGroup: "rg-b", subscriptionId: first, annual_savings: null, currency: null },
+  ],
+  partial: false, errors: [], error: null, note: null,
+};
 const executive = {
   currency: "USD", days: 30, as_of: "2026-11-10", empty: true, mixed_currency: false,
   kpis: { total: null, previous: null, change_pct: null, daily_avg: null, resources: null, services: null, subscriptions: null, regions: null, top5_share_pct: null },
@@ -34,6 +43,7 @@ const executive = {
   areas: [], movers: [], subscriptions: [], resource_groups: [], regions: [], services: [], monthly: null,
 };
 
+const scoreTable = (page: Page) => page.getByRole("table", { name: /Azure Advisor scores/ });
 async function mount(route: string, costError = true, scoreError = false) {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   page.setDefaultTimeout(10_000);
@@ -48,6 +58,7 @@ async function mount(route: string, costError = true, scoreError = false) {
     let data: unknown = {};
     if (path === "dashboard/advisor-score") data = report(url.searchParams.get("scope"));
     else if (path === "dashboard/executive") data = executive;
+    else if (path === "dashboard/advisor") data = advisorRecommendations;
     else if (path === "auth/me") data = { authenticated: true, mode: "local", user: { name: "Fixture", admin: true, source: "file" } };
     else if (path === "subscriptions") data = { subscriptions: [{ id: first, name: "First", azure_access: true }, { id: second, name: "Second", azure_access: true }], count: 2 };
     else if (path === "reporting-period") data = { available_months: ["2026-09"], empty: false };
@@ -91,19 +102,19 @@ describe("native Advisor Score navigation and independent landing strip", () => 
       await strip.getByText("87.6%", { exact: true }).first().waitFor();
       await page.getByText("Cost source unavailable", { exact: true }).waitFor();
       await strip.getByRole("link", { name: "View subscription scores" }).click();
-      await page.getByRole("table").waitFor();
+      await scoreTable(page).waitFor();
       const url = new URL(page.url());
       expect(url.pathname).toBe("/v2/optimize/advisor-score");
       expect(url.searchParams.get("scope")).toBe(first);
       expect(url.searchParams.get("month")).toBe("2026-09");
       expect(url.searchParams.get("currency")).toBe("EUR");
-      expect(await page.getByRole("table").innerText()).toContain("2026-11-10 12:30:00 UTC");
+      expect(await scoreTable(page).innerText()).toContain("2026-11-10 12:30:00 UTC");
       await page.getByRole("button", { name: "Subscription scope", exact: true }).click();
       await page.getByRole("option", { name: "All subscriptions", exact: true }).click();
       await page.getByRole("option").filter({ hasText: "Second" }).click();
       await page.keyboard.press("Escape");
-      await page.getByRole("table").getByText("Advisor permission denied", { exact: true }).waitFor();
-      expect(await page.getByRole("table").innerText()).not.toContain("87.6%");
+      await scoreTable(page).getByText("Advisor permission denied", { exact: true }).waitFor();
+      expect(await scoreTable(page).innerText()).not.toContain("87.6%");
       expect(requests.some(r => r.pathname === "/api/dashboard/advisor-score" && r.searchParams.get("scope") === second)).toBe(true);
       for (const request of requests.filter(r => r.pathname === "/api/dashboard/advisor-score")) {
         expect([...request.searchParams.keys()].every(key => key === "scope")).toBe(true);
@@ -122,8 +133,24 @@ describe("native Advisor Score navigation and independent landing strip", () => 
       expect(spend!.y + spend!.height).toBeLessThan(scores!.y);
       expect(scores!.height).toBeLessThan(85);
       await page.getByRole("navigation", { name: "Workspaces" }).getByRole("link", { name: "Advisor Score", exact: true }).click();
-      await page.getByRole("table").waitFor();
+      await scoreTable(page).waitFor();
       expect(new URL(page.url()).searchParams.get("scope")).toBe(first);
+      expect(errors).toEqual([]);
+    } finally { await page.close(); }
+  }, 60_000);
+  it("filters Advisor recommendations by pillar and impact", async () => {
+    const { page, requests, errors } = await mount(`/optimize/advisor-score?scope=${first}`, false);
+    try {
+      const section = page.getByRole("region", { name: "Advisor recommendations", exact: true });
+      await section.getByText("Right-size underutilized virtual machines").waitFor();
+      expect(await section.getByText("3 of 3 recommendations · All pillars").count()).toBe(1);
+      await section.getByRole("combobox", { name: "Pillar", exact: true }).selectOption("Security");
+      await section.getByText("1 of 3 recommendations · Security").waitFor();
+      await section.getByText("Enable MFA for accounts with owner permissions").waitFor();
+      expect(await section.getByText("Right-size underutilized virtual machines").count()).toBe(0);
+      await section.getByRole("combobox", { name: "Impact", exact: true }).selectOption("Low");
+      await section.getByText("0 of 3 recommendations · Security").waitFor();
+      expect(requests.filter(r => r.pathname === "/api/dashboard/advisor").every(r => r.searchParams.get("category") === "All")).toBe(true);
       expect(errors).toEqual([]);
     } finally { await page.close(); }
   }, 60_000);
@@ -131,11 +158,11 @@ describe("native Advisor Score navigation and independent landing strip", () => 
     const { page, recover, errors } = await mount(`/optimize/advisor-score?scope=${first}`, true, true);
     try {
       await page.getByText("Advisor source unavailable", { exact: true }).waitFor();
-      expect(await page.getByRole("table").count()).toBe(0);
+      expect(await scoreTable(page).count()).toBe(0);
       recover();
       await page.getByRole("button", { name: "Try again", exact: true }).click();
-      await page.getByRole("table").waitFor();
-      expect(await page.getByRole("table").innerText()).toContain("87.6%");
+      await scoreTable(page).waitFor();
+      expect(await scoreTable(page).innerText()).toContain("87.6%");
       expect(errors).toEqual([]);
     } finally { await page.close(); }
   }, 60_000);

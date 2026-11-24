@@ -828,7 +828,10 @@ async def advisor_recommendations(subscription_ids: list[str] | None = None,
         from urllib.parse import urlparse
 
         url = f"{ARM}/subscriptions/{sub}/providers/Microsoft.Advisor/recommendations"
-        params = {"api-version": "2023-01-01", "$filter": f"Category eq '{category}'"}
+        params = {"api-version": "2023-01-01"}
+        # "All" is a view over every pillar, not an Advisor category; filtering on it returns nothing.
+        if category != "All":
+            params["$filter"] = f"Category eq '{category}'"
         records: list[dict] = []
         seen: set[str] = set()
         for _ in range(100):
@@ -858,6 +861,8 @@ async def advisor_recommendations(subscription_ids: list[str] | None = None,
             resource_group = next((parts[i + 1] for i, part in enumerate(parts[:-1])
                                    if part.lower() == "resourcegroups"), None)
             out.append({
+                "id": rec.get("id"),
+                "category": p.get("category"),
                 "problem": (p.get("shortDescription") or {}).get("problem"),
                 "solution": (p.get("shortDescription") or {}).get("solution"),
                 "impact": p.get("impact"),

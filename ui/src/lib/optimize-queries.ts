@@ -60,7 +60,8 @@ export interface WasteReport {
   findings: Array<{ category: string; count: number; cost?: number | null; why?: string; impact_note?: string; items: WasteItem[] }>;
 }
 export interface AdvisorRow {
-  id?: string; impact?: string; problem?: string; solution?: string; resource?: string;
+  id?: string; category?: string; impact?: string; problem?: string; solution?: string; resource?: string;
+  resourceGroup?: string | null; subscriptionId?: string; resource_type?: string | null;
   currency?: string; annual_savings: number | null;
 }
 export interface AdvisorReport {
