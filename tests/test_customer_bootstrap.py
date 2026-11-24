@@ -93,7 +93,7 @@ exit $global:preflightCode
                     bundle.writestr("../escaped.txt", "must not extract")
             digest = "0" * 64 if bad_hash else hashlib.sha256(archive.read_bytes()).hexdigest()
             checksum = root / "fixture.sha"
-            checksum.write_text(f"{digest}  CloudLens-2026.11.12-rc5-source.zip\n")
+            checksum.write_text(f"{digest}  CloudLens-2026.11.24-dev1-source.zip\n")
             target = root / "deployment"
             if exists:
                 target.mkdir()

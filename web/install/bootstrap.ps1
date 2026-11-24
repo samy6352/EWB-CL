@@ -6,7 +6,10 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')]
-    [string]$Version = '2026.11.12-rc5',
+    [string]$Version = '2026.11.24-dev1',
+    # GitHub repository whose releases hold the verified source ZIP and SHA256SUMS.txt.
+    [ValidatePattern('^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$')]
+    [string]$Repository = 'samy6352/cloudlens-installer',
     [string]$Destination = '',
     [string]$SubscriptionId = '',
     # What CloudLens should monitor. Empty or 'all' includes every enabled same-tenant
@@ -98,7 +101,7 @@ if (Test-Path -LiteralPath $Destination) {
 $Destination = [IO.Path]::GetFullPath($Destination)
 $null = New-Item -ItemType Directory -Path $Destination
 $asset = "CloudLens-$Version-source.zip"
-$base = "https://github.com/samy6352/EWB-CL/releases/download/v$Version"
+$base = "https://github.com/$Repository/releases/download/v$Version"
 $zip = Join-Path $Destination $asset
 $checksums = Join-Path $Destination 'SHA256SUMS.txt'
 if ($SourceZip) {
