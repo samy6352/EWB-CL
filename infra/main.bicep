@@ -152,20 +152,10 @@ param authDelegatedArm bool = true
 @description('The app creates its own FOCUS exports (one per visible subscription) and imports the last 3 months on first start; earlier months, up to 13, are optional from Setup. Needs Cost Management Contributor for the app identity on the monitored scope.')
 param managedExports bool = false
 
-@description('Turn on Microsoft Defender for open-source relational databases (covers PostgreSQL flexible servers) for the whole subscription. Billed per protected server and needs Owner or Security Admin on the subscription, so it is off by default; enable it where the customer requires the Defender recommendation closed.')
-param enableDefenderForPostgres bool = false
-
 @description('Tags applied to every resource.')
 param tags object = {
   application: 'CloudLens'
   workload: 'azure-cost-management'
-}
-
-resource defenderForPostgres 'Microsoft.Security/pricings@2024-01-01' = if (enableDefenderForPostgres) {
-  name: 'OpenSourceRelationalDatabases'
-  properties: {
-    pricingTier: 'Standard'
-  }
 }
 
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
