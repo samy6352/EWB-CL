@@ -83,7 +83,7 @@ function Sidebar() {
         )}
       </Link>
 
-      <nav aria-label="Workspaces" className="hidden space-y-2 px-2 py-1 [@media(min-height:49em)]:block">
+      <nav aria-label="Workspaces" className="hidden min-h-0 flex-1 space-y-2 overflow-y-auto px-2 py-1 [@media(min-height:30em)]:block">
         {workspaces.map((ws) => {
           return (
             <div key={ws.id}>
@@ -134,7 +134,7 @@ function Sidebar() {
         })}
       </nav>
 
-      <nav aria-label="Workspaces" className="grid gap-1 px-2 py-1 [@media(min-height:49em)]:hidden">
+      <nav aria-label="Workspaces" className="grid gap-1 px-2 py-1 [@media(min-height:30em)]:hidden">
         <div className="relative">
           <select aria-label="Choose workspace" title={`Workspace: ${workspace.label}`} className={compactSelect}
             value={workspace.id} onChange={(event) => {

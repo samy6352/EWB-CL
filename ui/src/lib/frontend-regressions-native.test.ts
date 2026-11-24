@@ -162,13 +162,16 @@ describe("frontend assessment regressions", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     const workspace = nav.getByRole("combobox", { name: "Choose workspace" });
     const destination = nav.getByRole("combobox", { name: "Choose page" });
-    await workspace.selectOption("admin");
-    expect(await destination.locator("option").allTextContents()).toContain("Audit log");
+    expect(await workspace.count()).toBe(0);
+    expect(await nav.getByRole("link", { name: "Audit log" }).count()).toBe(1);
     await expectFits();
     await page.getByRole("button", { name: "Collapse sidebar" }).click();
     await expectFits();
 
     await page.setViewportSize({ width: 390, height: 360 });
+    await workspace.selectOption("admin");
+    expect(await destination.locator("option").allTextContents()).toContain("Audit log");
+    await expectFits();
     await workspace.selectOption("explore");
     await destination.selectOption("history");
     await expectFits();
