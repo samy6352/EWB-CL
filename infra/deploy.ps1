@@ -916,6 +916,7 @@ if ($clientId) {
         Write-Warning "the subscription. An administrator grants it with:"
         Write-Warning "  az ad app permission admin-consent --id $clientId"
         Write-Warning ""
+        $env:CLOUDLENS_PENDING_CONSENT_APP = $clientId
         if (-not $AllowAppIdentityFallback) {
             throw 'Delegated ARM consent is required. Have the tenant administrator grant consent and rerun, or explicitly choose -AllowAppIdentityFallback for limited app-identity mode.'
         }

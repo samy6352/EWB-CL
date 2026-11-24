@@ -53,6 +53,10 @@ param(
 
     [string]$VnetAddressPrefix = '10.70.0.0/16',
 
+    [string]$ExistingAppSubnetId = '',
+    [string]$ExistingPostgresSubnetId = '',
+    [string]$ExistingPrivateEndpointSubnetId = '',
+
     [switch]$AppIdentityOnly
 )
 
@@ -302,7 +306,10 @@ if ($offered -contains $ModelSku) {
     }
 }
 
-if ($NetworkIsolation) {
+if ($NetworkIsolation -and $ExistingAppSubnetId -and $ExistingPostgresSubnetId -and $ExistingPrivateEndpointSubnetId) {
+    Section "Network address planning"
+    Ok "reusing existing subnets; no new VNet is created, so address overlap does not apply (deploy.ps1 validates delegation and size)"
+} elseif ($NetworkIsolation) {
     Section "Network address planning"
     $null = Get-CloudLensIpv4Range $VnetAddressPrefix
     $vnets = az network vnet list --subscription $account.id -o json 2>$null | ConvertFrom-Json

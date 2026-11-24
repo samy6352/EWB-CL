@@ -456,6 +456,15 @@ Step 'Deploying CloudLens (infra/deploy.ps1)'
 $priorConfig = $env:AZURE_CONFIG_DIR
 $priorTelemetry = $env:AZURE_CORE_COLLECT_TELEMETRY
 $private = $null
+# A log survives a dropped terminal or session; the local password is printed only after it stops.
+$script:TranscriptPath = $null
+try {
+    $logDir = Join-Path $HOME '.cloudlens\logs'
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    $script:TranscriptPath = Join-Path $logDir ("install-{0:yyyyMMdd-HHmmss}.log" -f $started)
+    Start-Transcript -Path $script:TranscriptPath -Force | Out-Null
+} catch { $script:TranscriptPath = $null }
+$env:CLOUDLENS_PENDING_CONSENT_APP = $null
 try {
 if ((Get-Command az).CommandType -eq 'Application') {
     $source = if ($env:AZURE_CONFIG_DIR) { $env:AZURE_CONFIG_DIR } else { Join-Path $HOME '.azure' }
@@ -584,6 +593,17 @@ if ($site) {
 Info "Monitoring   : $($target.Path)"
 if ($exportsPartial) { Write-Warning 'Installed, but some subscriptions still need a role grant or export from someone with access there (commands are printed above and on the Setup page). Re-run this installer or infra\add-subscriptions.ps1 afterwards.' }
 Info 'App installation and billing data readiness are separate. First cost data usually arrives within a few hours; a brand-new export can take up to 24 h.'
+if ($env:CLOUDLENS_PENDING_CONSENT_APP) {
+    Write-Host ''
+    Write-Host '    ACTION NEEDED (one time, by a Cloud Application Administrator or higher):' -ForegroundColor Yellow
+    Write-Host "      az ad app permission admin-consent --id $($env:CLOUDLENS_PENDING_CONSENT_APP)" -ForegroundColor Yellow
+    Info 'Until then CloudLens works in limited app-identity mode. Afterwards, rerun this same install command to upgrade.'
+}
+if ($script:TranscriptPath) {
+    Info "Install log  : $($script:TranscriptPath)"
+    try { Stop-Transcript | Out-Null } catch { }
+    $script:TranscriptPath = $null
+}
 if ($localPassword) {
     Write-Host ''
     Write-Host '    Sign in as   : admin' -ForegroundColor Green
@@ -594,6 +614,7 @@ if ($localPassword) {
     Info 'Sign in as the existing local administrator.'
 }
 } finally {
+    if ($script:TranscriptPath) { try { Stop-Transcript | Out-Null } catch { } }
     Write-Progress -Activity 'CloudLens install' -Completed
     $env:AZURE_CONFIG_DIR = $priorConfig
     $env:AZURE_CORE_COLLECT_TELEMETRY = $priorTelemetry
