@@ -461,7 +461,7 @@ export function OverviewPage() {
 
   const views = useMemo<ExecutiveView[]>(() => {
     const data = query.data;
-    if (!data) return [];
+    if (!data || data.empty || !data.trend) return [];
     if (data.by_currency?.length) return data.by_currency;
     return [data];
   }, [query.data]);
@@ -498,6 +498,7 @@ export function OverviewPage() {
 
   if (query.isError) return <div className="min-w-0"><PageHeader title="Overview" compact /><ErrorState error={query.error} onRetry={() => void query.refetch()} /><div className="mt-2"><AdvisorScorePanel /></div></div>;
 
+  const noData = !!query.data && !view;
   const topArea = view ? [...view.areas].sort((a, b) => b.cost - a.cost)[0] : undefined;
   const topMover = view?.movers.find((r) => r.delta != null);
   const landscapeRows = view?.[landscape] ?? [];
@@ -513,6 +514,8 @@ export function OverviewPage() {
             <>
               {period} · data to <span className="num">{view.as_of}</span>
             </>
+          ) : noData ? (
+            "Waiting for the first cost import"
           ) : (
             <Skeleton className="h-4 w-56" />
           )
@@ -529,6 +532,11 @@ export function OverviewPage() {
         }
       />
       {query.data?.notice && <p className="mb-2 text-xs text-muted">{query.data.notice}</p>}
+      {noData && (
+        <p role="status" className="mb-2 rounded-lg border border-border bg-surface-2 p-3 text-sm text-muted">
+          No cost data has been imported yet. A new export usually delivers its first report within a few hours (up to 24 h). Track progress on the Setup page; this page fills in automatically after the first import.
+        </p>
+      )}
 
       <SummaryBar view={view} money={(v) => money(v)} numbers={numbers} loading={loading} />
       {view && ordered.length > 1 && <p className="mt-1 text-right text-[11px] text-muted">One currency at a time. Totals are never combined or converted.</p>}

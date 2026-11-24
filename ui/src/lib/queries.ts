@@ -67,6 +67,7 @@ export interface ExecutiveView {
 }
 
 export interface Executive extends ExecutiveView {
+  empty?: boolean;
   mixed_currency: boolean;
   by_currency?: ExecutiveView[];
   notice?: string;
