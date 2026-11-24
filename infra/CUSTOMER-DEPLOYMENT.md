@@ -91,6 +91,20 @@ customer's network owner; for a custom range pass `-VnetAddressPrefix`,
 `-AppSubnetAddressPrefix`, `-PostgresSubnetAddressPrefix` and
 `-PrivateEndpointSubnetAddressPrefix` to both runs.
 
+To deploy into the customer's existing network instead, pass
+`-ExistingAppSubnetId`, `-ExistingPostgresSubnetId` and
+`-ExistingPrivateEndpointSubnetId` (all three, to both runs). The subnets must
+be in one VNet in the deployment region, and CloudLens does not change that
+VNet. The app subnet must be delegated to `Microsoft.Web/serverFarms` (/28 or
+larger), the PostgreSQL subnet to `Microsoft.DBforPostgreSQL/flexibleServers`
+(/28 or larger, no other resources), and the private endpoint subnet must be
+undelegated. The installer checks all of this before provisioning. The
+deploying account needs `Microsoft.Network/virtualNetworks/subnets/join/action`
+on the subnets and rights to link private DNS zones to the VNet (for example
+Network Contributor on it). CloudLens creates its own private DNS zones and
+links them to that VNet; if the network team already owns zones with the same
+names for that VNet, raise it before approving the preview.
+
 Start in PowerShell 7 in `FullLanguage` mode. Check the current mode with
 `$ExecutionContext.SessionState.LanguageMode`. The bootstrap and checkout
 preview do not support `ConstrainedLanguage`. If your workstation enforces it,

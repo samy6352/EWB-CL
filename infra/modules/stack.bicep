@@ -66,6 +66,15 @@ param privateEndpointSubnetAddressPrefix string = '10.70.3.0/24'
 @description('Developer client IP allowed through the PostgreSQL firewall when not isolated.')
 param developerClientIp string
 
+@description('Existing subnet resource ID for App Service VNet integration, delegated to Microsoft.Web/serverFarms. Supply all three existing subnet IDs, in one VNet and in the same region, to reuse a customer network; leave all empty to create a new VNet.')
+param existingAppSubnetId string = ''
+
+@description('Existing subnet resource ID for PostgreSQL, delegated to Microsoft.DBforPostgreSQL/flexibleServers and empty of other resources.')
+param existingPostgresSubnetId string = ''
+
+@description('Existing subnet resource ID for private endpoints, with private endpoint network policies allowed.')
+param existingPrivateEndpointSubnetId string = ''
+
 @description('App Service plan SKU.')
 param appServicePlanSku string
 
@@ -185,6 +194,16 @@ var foundryDnsZoneNames = [
   'privatelink.services.ai.azure.com'
 ]
 
+// Bring-your-own network: when all three subnets are supplied the VNet is not
+// created and nothing in it is modified. The private DNS zones are still created
+// here and linked to the VNet that holds the app subnet.
+var useExistingNetwork = !empty(existingAppSubnetId) && !empty(existingPostgresSubnetId) && !empty(existingPrivateEndpointSubnetId)
+var createVnet = networkIsolation && !useExistingNetwork
+var appSubnetId = useExistingNetwork ? existingAppSubnetId : '${vnet.id}/subnets/snet-app'
+var postgresSubnetId = useExistingNetwork ? existingPostgresSubnetId : '${vnet.id}/subnets/snet-postgres'
+var privateEndpointSubnetId = useExistingNetwork ? existingPrivateEndpointSubnetId : '${vnet.id}/subnets/snet-privatelink'
+var dnsLinkVnetId = useExistingNetwork ? substring(existingAppSubnetId, 0, lastIndexOf(existingAppSubnetId, '/subnets/')) : vnet.id
+
 // Role definition IDs are constants across every Azure tenant.
 var storageBlobDataContributor = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
 var monitoringMetricsPublisher = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '3913510d-42f4-4e42-8a64-420c390055eb')
@@ -229,7 +248,7 @@ resource insights 'Microsoft.Insights/components@2020-02-02' = {
 
 // ----------------------------------------------------------------- network
 
-resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = if (networkIsolation) {
+resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = if (createVnet) {
   name: vnetName
   location: location
   tags: tags
@@ -296,7 +315,7 @@ resource postgresDnsLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@
   properties: {
     registrationEnabled: false
     virtualNetwork: {
-      id: vnet.id
+      id: dnsLinkVnetId
     }
   }
 }
@@ -314,7 +333,7 @@ resource blobDnsLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024
   properties: {
     registrationEnabled: false
     virtualNetwork: {
-      id: vnet.id
+      id: dnsLinkVnetId
     }
   }
 }
@@ -373,7 +392,7 @@ resource blobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = i
   tags: tags
   properties: {
     subnet: {
-      id: '${vnet.id}/subnets/snet-privatelink'
+      id: privateEndpointSubnetId
     }
     privateLinkServiceConnections: [
       {
@@ -449,7 +468,7 @@ resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
       tenantId: subscription().tenantId
     }
     network: networkIsolation ? {
-      delegatedSubnetResourceId: '${vnet.id}/subnets/snet-postgres'
+      delegatedSubnetResourceId: postgresSubnetId
       privateDnsZoneArmResourceId: postgresDnsZone.id
       publicNetworkAccess: 'Disabled'
     } : {
@@ -627,7 +646,7 @@ resource foundryDnsLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@
   properties: {
     registrationEnabled: false
     virtualNetwork: {
-      id: vnet.id
+      id: dnsLinkVnetId
     }
   }
 }]
@@ -638,7 +657,7 @@ resource foundryPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' 
   tags: tags
   properties: {
     subnet: {
-      id: '${vnet.id}/subnets/snet-privatelink'
+      id: privateEndpointSubnetId
     }
     privateLinkServiceConnections: [
       {
@@ -703,7 +722,7 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
     serverFarmId: plan.id
     httpsOnly: true
     // Empty when not isolated, which App Service reads as "no VNet integration".
-    virtualNetworkSubnetId: networkIsolation ? '${vnet.id}/subnets/snet-app' : null
+    virtualNetworkSubnetId: networkIsolation ? appSubnetId : null
     vnetRouteAllEnabled: networkIsolation
     siteConfig: {
       linuxFxVersion: 'PYTHON|3.13'

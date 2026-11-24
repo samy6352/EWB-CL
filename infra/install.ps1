@@ -65,6 +65,11 @@ param(
     [string]$PostgresSubnetAddressPrefix = '10.70.2.0/24',
     [string]$PrivateEndpointSubnetAddressPrefix = '10.70.3.0/24',
 
+    # Reuse existing customer subnets (all three, same VNet and region) instead of creating a VNet.
+    [string]$ExistingAppSubnetId = '',
+    [string]$ExistingPostgresSubnetId = '',
+    [string]$ExistingPrivateEndpointSubnetId = '',
+
     [string]$EntraAppUniqueName = 'cloudlens',
 
     # Optional resource names: {NamePrefix}-web-{NameSuffix}, {NamePrefix}-postgres-{NameSuffix}, ...
@@ -487,7 +492,7 @@ else { $deploy.CostScopeSubscriptions = @($target.Id) }
 if ($EntraClientId) { $deploy.EntraClientId = $EntraClientId }
 if (-not $RequireDelegatedArm) { $deploy.AllowAppIdentityFallback = $true }
 if ($AppIdentityOnly) { $deploy.AppIdentityOnly = $true }
-foreach ($key in @('VnetAddressPrefix', 'AppSubnetAddressPrefix', 'PostgresSubnetAddressPrefix', 'PrivateEndpointSubnetAddressPrefix')) {
+foreach ($key in @('VnetAddressPrefix', 'AppSubnetAddressPrefix', 'PostgresSubnetAddressPrefix', 'PrivateEndpointSubnetAddressPrefix', 'ExistingAppSubnetId', 'ExistingPostgresSubnetId', 'ExistingPrivateEndpointSubnetId')) {
     if ($PSBoundParameters.ContainsKey($key)) { $deploy[$key] = $PSBoundParameters[$key] }
 }
 if ($NamePrefix) { $deploy.NamePrefix = $NamePrefix }

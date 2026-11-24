@@ -67,6 +67,15 @@ param privateEndpointSubnetAddressPrefix string = '10.70.3.0/24'
 @description('Client IP allowed through the PostgreSQL firewall when networkIsolation is false. Ignored otherwise.')
 param developerClientIp string = ''
 
+@description('Optional: resource ID of an existing subnet for App Service VNet integration, delegated to Microsoft.Web/serverFarms. Supply all three existing subnet IDs (same VNet, same region as location) to deploy into a customer network without creating a VNet; the address-prefix parameters are then ignored.')
+param existingAppSubnetId string = ''
+
+@description('Optional: resource ID of an existing subnet for PostgreSQL, delegated to Microsoft.DBforPostgreSQL/flexibleServers.')
+param existingPostgresSubnetId string = ''
+
+@description('Optional: resource ID of an existing subnet for private endpoints.')
+param existingPrivateEndpointSubnetId string = ''
+
 @description('App Service plan SKU. B2 is the reference floor for the measured multi-million-row workload.')
 param appServicePlanSku string = 'B2'
 
@@ -181,6 +190,9 @@ module stack 'modules/stack.bicep' = {
     postgresSubnetAddressPrefix: postgresSubnetAddressPrefix
     privateEndpointSubnetAddressPrefix: privateEndpointSubnetAddressPrefix
     developerClientIp: developerClientIp
+    existingAppSubnetId: existingAppSubnetId
+    existingPostgresSubnetId: existingPostgresSubnetId
+    existingPrivateEndpointSubnetId: existingPrivateEndpointSubnetId
     appServicePlanSku: appServicePlanSku
     postgresSku: postgresSku
     postgresVersion: postgresVersion

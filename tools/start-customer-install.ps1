@@ -18,6 +18,9 @@ param(
     [string]$AppSubnetAddressPrefix,
     [string]$PostgresSubnetAddressPrefix,
     [string]$PrivateEndpointSubnetAddressPrefix,
+    [string]$ExistingAppSubnetId,
+    [string]$ExistingPostgresSubnetId,
+    [string]$ExistingPrivateEndpointSubnetId,
     [switch]$Apply,
     [switch]$NoToolInstall
 )

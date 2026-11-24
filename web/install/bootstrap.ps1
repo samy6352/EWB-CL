@@ -21,6 +21,10 @@ param(
     [string]$AppSubnetAddressPrefix = '',
     [string]$PostgresSubnetAddressPrefix = '',
     [string]$PrivateEndpointSubnetAddressPrefix = '',
+    # Reuse existing subnets (all three, same VNet and region as -Location) instead of creating a VNet.
+    [string]$ExistingAppSubnetId = '',
+    [string]$ExistingPostgresSubnetId = '',
+    [string]$ExistingPrivateEndpointSubnetId = '',
     [ValidateSet('small', 'medium', 'large')]
     [string]$Size = 'medium',
     [ValidateRange(1, 13)]
@@ -70,6 +74,16 @@ foreach ($key in $networkNames) {
 }
 if ($networkOptions.Count -and ($networkOptions.Count -ne 4 -or @($networkOptions.Values | Where-Object { -not $_ }).Count)) {
     throw 'For a custom network, supply a VNet prefix and all three subnet prefixes.'
+}
+$existingNetworkOptions = @{}
+foreach ($key in @('ExistingAppSubnetId', 'ExistingPostgresSubnetId', 'ExistingPrivateEndpointSubnetId')) {
+    if ($PSBoundParameters.ContainsKey($key) -and $PSBoundParameters[$key]) { $existingNetworkOptions[$key] = $PSBoundParameters[$key] }
+}
+if ($existingNetworkOptions.Count -and $existingNetworkOptions.Count -ne 3) {
+    throw 'To use an existing network, supply all three of -ExistingAppSubnetId, -ExistingPostgresSubnetId and -ExistingPrivateEndpointSubnetId.'
+}
+if ($existingNetworkOptions.Count -and $networkOptions.Count) {
+    throw 'Use either existing subnet IDs or new address prefixes, not both.'
 }
 Write-SetupStage 1 'Verify the source archive' 'Check the archive checksum and paths before running anything from it.'
 if ($EntraClientId -and $EntraClientId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
@@ -498,6 +512,13 @@ try {
         Size = $Size; InitialHistoryMonths = $InitialHistoryMonths
     }
     foreach ($key in $networkOptions.Keys) { $options[$key] = $networkOptions[$key] }
+    if ($existingNetworkOptions.Count) {
+        $installerParameters = (Get-Command -Name $installer).Parameters
+        foreach ($key in $existingNetworkOptions.Keys) {
+            if (-not $installerParameters.ContainsKey($key)) { throw "This release does not support existing-network parameter $key." }
+            $options[$key] = $existingNetworkOptions[$key]
+        }
+    }
     if ($RuntimeAccessMode -eq 'managed-identity') {
         if ($installerSupportsAppIdentityOnly -and $deploySupportsAppIdentityOnly) {
             $options.AppIdentityOnly = $true
@@ -553,7 +574,7 @@ try {
         'Monitoring scope'     = $scopeSummary
         'App / database'       = $Location
         'AI region'            = $AiLocation
-        'VNet range'           = $(if ($VnetAddressPrefix) { $VnetAddressPrefix } else { 'Release default (review What-If)' })
+        'VNet range'           = $(if ($existingNetworkOptions.Count) { "Existing subnets in $(($ExistingAppSubnetId -split '/subnets/')[0] -split '/')[-1]" } elseif ($VnetAddressPrefix) { $VnetAddressPrefix } else { 'Release default (review What-If)' })
         'Sizing'               = "$Size (App Service $planSku / PostgreSQL $pgSku)"
         'First import'         = "$InitialHistoryMonths month(s)"
         'Naming'               = $(if ($NamePrefix) { "$NamePrefix / $NameSuffix (prefix / suffix)" } else { 'Generated' })

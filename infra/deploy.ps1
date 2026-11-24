@@ -75,6 +75,14 @@ param(
     [string]$PostgresSubnetAddressPrefix = '10.70.2.0/24',
     [string]$PrivateEndpointSubnetAddressPrefix = '10.70.3.0/24',
 
+    # Reuse a customer network instead of creating one: pass all three subnet resource IDs,
+    # in one VNet and in -Location. The address-prefix parameters are then ignored. The
+    # subnets must already be delegated (app: Microsoft.Web/serverFarms, PostgreSQL:
+    # Microsoft.DBforPostgreSQL/flexibleServers); CloudLens never alters the VNet.
+    [string]$ExistingAppSubnetId = '',
+    [string]$ExistingPostgresSubnetId = '',
+    [string]$ExistingPrivateEndpointSubnetId = '',
+
     [ValidateRange(1, 1000000)]
     [int]$ModelCapacity = 30,
 
@@ -199,8 +207,15 @@ if ($ManagedExports -and -not $EnableExportManagement) {
 . (Join-Path $PSScriptRoot 'deployment-checks.ps1')
 . (Join-Path $PSScriptRoot 'cost-access.ps1')
 . (Join-Path $PSScriptRoot 'storage-naming.ps1')
-if ($NetworkIsolation) {
-    $network = Get-CloudLensIpv4Range $VnetAddressPrefix
+$existingSubnetIds = @($ExistingAppSubnetId, $ExistingPostgresSubnetId, $ExistingPrivateEndpointSubnetId)
+$useExistingNetwork = $NetworkIsolation -and -not [string]::IsNullOrWhiteSpace($existingSubnetIds -join '')
+if ($useExistingNetwork -and ($existingSubnetIds | Where-Object { [string]::IsNullOrWhiteSpace($_) })) {
+    throw 'Reusing a network needs all three of -ExistingAppSubnetId, -ExistingPostgresSubnetId and -ExistingPrivateEndpointSubnetId.'
+}
+if (-not $NetworkIsolation -and -not [string]::IsNullOrWhiteSpace($existingSubnetIds -join '')) {
+    throw 'Existing subnets only apply to the isolated shape; remove them or use -NetworkIsolation $true.'
+}
+if ($NetworkIsolation -and -not $useExistingNetwork) {
     $subnets = @($AppSubnetAddressPrefix, $PostgresSubnetAddressPrefix, $PrivateEndpointSubnetAddressPrefix)
     foreach ($subnet in $subnets) {
         $range = Get-CloudLensIpv4Range $subnet
@@ -575,6 +590,39 @@ $priorClientId = if ($EntraClientId) { $EntraClientId } else { (az ad app list -
 if ($priorClientId) { $priorRedirectUris = @(az ad app show --id $priorClientId --query "publicClient.redirectUris" -o tsv 2>$null | Where-Object { $_ }) }
 
 Step "Deploying infrastructure to $ResourceGroup ($Location)"
+if ($useExistingNetwork) {
+    # Fail here, in seconds, rather than after a 20-minute deployment rejects the subnet.
+    $vnetIds = @()
+    foreach ($entry in @(
+        @{ Label = 'App'; Id = $ExistingAppSubnetId; Delegation = 'Microsoft.Web/serverFarms' }
+        @{ Label = 'PostgreSQL'; Id = $ExistingPostgresSubnetId; Delegation = 'Microsoft.DBforPostgreSQL/flexibleServers' }
+        @{ Label = 'Private endpoint'; Id = $ExistingPrivateEndpointSubnetId; Delegation = '' }
+    )) {
+        if ($entry.Id -notmatch '(?i)^(/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Network/virtualNetworks/[^/]+)/subnets/[^/]+$') {
+            throw "$($entry.Label) subnet ID is not a subnet resource ID: $($entry.Id)"
+        }
+        $vnetIds += $Matches[1].ToLower()
+        $subnet = az network vnet subnet show --ids $entry.Id -o json 2>$null | ConvertFrom-Json
+        if (-not $subnet) { throw "$($entry.Label) subnet was not found or is not readable: $($entry.Id)" }
+        $vnetInfo = az network vnet show --ids $Matches[1] --query '{location:location}' -o json 2>$null | ConvertFrom-Json
+        if ($vnetInfo -and ($vnetInfo.location -ne $Location)) {
+            throw "VNet is in $($vnetInfo.location) but -Location is $Location; App Service VNet integration needs the same region."
+        }
+        $delegations = @($subnet.delegations | ForEach-Object { $_.serviceName })
+        if ($entry.Delegation -and ($delegations -notcontains $entry.Delegation)) {
+            throw "$($entry.Label) subnet must be delegated to $($entry.Delegation). Add the delegation in the portal or with: az network vnet subnet update --ids '$($entry.Id)' --delegations $($entry.Delegation)"
+        }
+        if (-not $entry.Delegation -and $delegations.Count -gt 0) {
+            throw "Private endpoint subnet is delegated to $($delegations -join ', '); private endpoints need an undelegated subnet."
+        }
+        $prefix = if ($subnet.addressPrefix) { $subnet.addressPrefix } else { @($subnet.addressPrefixes)[0] }
+        if ($entry.Delegation -and $prefix -and [int]$prefix.Split('/')[1] -gt 28) {
+            throw "$($entry.Label) subnet $prefix must be /28 or larger."
+        }
+        Write-Host "    existing subnet: $($entry.Label) $prefix OK"
+    }
+    if (@($vnetIds | Select-Object -Unique).Count -ne 1) { throw 'All three existing subnets must be in the same VNet.' }
+}
 $deploymentName = "cloudlens-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 
 $templateFile = Join-Path $PSScriptRoot 'main.bicep'
@@ -592,6 +640,9 @@ $templateParameters = @(
     "appSubnetAddressPrefix=$AppSubnetAddressPrefix"
     "postgresSubnetAddressPrefix=$PostgresSubnetAddressPrefix"
     "privateEndpointSubnetAddressPrefix=$PrivateEndpointSubnetAddressPrefix"
+    "existingAppSubnetId=$ExistingAppSubnetId"
+    "existingPostgresSubnetId=$ExistingPostgresSubnetId"
+    "existingPrivateEndpointSubnetId=$ExistingPrivateEndpointSubnetId"
     "developerClientIp=$developerIp"
     "aiLocation=$AiLocation"
     "modelName=$ModelName"
