@@ -49,6 +49,14 @@ to select an approved exact version, including a pilot. Keep the extracted
 deployment source and state for recovery. This is a new-install entry point,
 not an automatic upgrade for existing instances.
 
+Before provisioning, setup checks whether your account holds a directory role
+that can grant tenant admin consent (Global Administrator, Privileged Role
+Administrator, Cloud Application Administrator or Application Administrator).
+If not, it says so up front and offers to install in limited app-identity mode
+(or stop for an administrator). Afterwards it prints the single
+`az ad app permission admin-consent` command for your administrator; re-run the
+same command to upgrade. Every run is logged to `~/.cloudlens/logs`.
+
 If GitHub has only prereleases, the default command stops before downloading.
 To preview a published pilot, use its version from the
 [Releases page](https://github.com/samy6352/EWB-CL/releases), without the `v` prefix:

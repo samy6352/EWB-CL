@@ -350,6 +350,35 @@ Info "source       : $root"
 Info "size         : $Size -- $($sizing.Rows): PostgreSQL $($sizing.PostgresSku), $($sizing.PostgresStorageGb) GB; App Service $($sizing.AppServicePlanSku)"
 Info "initial data : $InitialHistoryMonths calendar month(s), newest first"
 
+# Consent for delegated ARM needs a directory role most installers lack. Say so now, not 8 minutes in.
+if (-not $AppIdentityOnly -and -not $LocalSignIn -and -not $EntraClientId) {
+    $canConsent = $null
+    try {
+        $roles = Invoke-Az @('rest', '--method', 'get', '--url',
+            'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.directoryRole?$select=displayName')
+        $consentRoles = 'Global Administrator', 'Privileged Role Administrator', 'Cloud Application Administrator', 'Application Administrator'
+        $canConsent = [bool]@($roles.value | Where-Object { $_.displayName -in $consentRoles }).Count
+    } catch { $canConsent = $null }
+    if ($canConsent -eq $false) {
+        Write-Host ''
+        Write-Host '    Heads-up: you do not hold a role that can grant tenant admin consent.' -ForegroundColor Yellow
+        Info 'CloudLens will install in limited app-identity mode and print one command for your administrator,'
+        Info 'who can upgrade it later. Pass -AppIdentityOnly to skip the consent attempt, or -RequireDelegatedArm to stop instead.'
+        if ($RequireDelegatedArm) {
+            throw 'Delegated ARM requires admin consent, which your account cannot grant. Ask a Cloud Application Administrator to run this install, or drop -RequireDelegatedArm. Nothing has been changed.'
+        }
+        if ($interactive) {
+            $go = Select-CloudLensOption 'How would you like to continue?' @(
+                @{ Label = 'Install now in app-identity mode; an administrator upgrades it later'; Value = 'identity' }
+                @{ Label = 'Stop, so an administrator can run the install'; Value = 'stop' }
+            )
+            if ($go -eq 'stop') { throw 'Stopped at your request. Nothing has been changed.' }
+            $AppIdentityOnly = [switch]::new($true)
+        }
+    } elseif ($canConsent) {
+        Info 'admin consent : your account can grant it'
+    }
+}
 $target = Resolve-CloudLensScope $Scope $hosting
 Step "Resolving the monitored scope ($($target.Path))"
 if ($target.Kind -eq 'all') {
