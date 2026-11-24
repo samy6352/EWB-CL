@@ -141,6 +141,7 @@ exit $global:preflightCode
                     "1",  # runtime: managed identity
                     "2",  # sign-in: create registration
                     "1",  # resource group naming mode: recommended
+                    "1",  # network: create new
                     "1",  # resource naming mode: generated
                     "1" if approve else "2",  # proceed / cancel
                 ]
@@ -153,11 +154,11 @@ exit $global:preflightCode
                 elif many_subscriptions:
                     answers[:2] = ["sandbox", "n", "", "not present", SUB, "1"]
             elif approve:
-                answers = []
+                answers = ["1"] if preview else []  # preview runs interactively: new network
             else:
-                answers = ["?", ""]  # read approval guidance, then cancel with Enter
+                answers = ["1", "?", ""]  # new network, read approval guidance, then cancel with Enter
             if retry_preview:
-                answers = ["1"]  # retry What-If; the preview flag prevents provisioning
+                answers = ["1", "1"]  # new network, then retry What-If; the preview flag prevents provisioning
             answers_literal = ",".join("'" + answer.replace("'", "''") + "'" for answer in answers)
             command = f"""
 $ErrorActionPreference = 'Stop'

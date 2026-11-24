@@ -419,6 +419,64 @@ try {
         }
     }
     if ($ResourceGroup -notmatch '^[A-Za-z0-9_-]{1,80}$') { throw 'Use 1-80 letters, digits, underscores or hyphens for the resource group.' }
+    if ($interactive -and -not $networkOptions.Count -and -not $existingNetworkOptions.Count) {
+        $networkMode = Select-InstallOption 'Network:' @(
+            @{ Label = 'Create a new network (CloudLens default ranges)'; Value = 'new' }
+            @{ Label = 'Use an existing VNet and choose its subnets'; Value = 'existing' }
+        ) 1 'An existing VNet keeps your own address ranges: CloudLens reads them from the subnets you pick and never changes them. The VNet must be in the same region as the app. A missing subnet delegation is added automatically when the account has permission.'
+        while ($networkMode -eq 'existing') {
+            $vnetName = (Read-Host 'Existing VNet name [Enter: create a new network instead]').Trim()
+            if (-not $vnetName) { break }
+            if ($vnetName -notmatch '^[A-Za-z0-9._-]{1,64}$') { Write-Warning 'Enter the VNet name only, not its resource ID.'; continue }
+            $vnets = @(Invoke-BootstrapAz @('network', 'vnet', 'list', '--subscription', $SubscriptionId, '--query',
+                "[?name=='$vnetName'].{id:id,name:name,rg:resourceGroup,location:location}") | Where-Object { $_ })
+            if (-not $vnets.Count) { Write-Warning "No VNet named '$vnetName' was found in the hosting subscription."; continue }
+            $inRegion = @($vnets | Where-Object { $_.location -ieq $Location })
+            if (-not $inRegion.Count) { Write-Warning "VNet '$vnetName' is in $($vnets[0].location), but the app region is $Location. They must match."; continue }
+            $chosenVnet = if ($inRegion.Count -eq 1) { $inRegion[0] } else {
+                $pick = Select-InstallOption "More than one VNet is named '$vnetName':" @($inRegion | ForEach-Object { @{ Label = "resource group $($_.rg)"; Value = $_ } }) 1 'Choose the resource group that holds the VNet.'
+                $pick
+            }
+            $allSubnets = @(Invoke-BootstrapAz @('network', 'vnet', 'subnet', 'list', '--subscription', $SubscriptionId,
+                '--resource-group', $chosenVnet.rg, '--vnet-name', $chosenVnet.name, '--query',
+                '[].{id:id,name:name,prefix:addressPrefix,prefixes:addressPrefixes,delegations:delegations[].serviceName}') | Where-Object { $_ })
+            $subnetRoles = @(
+                @{ Label = 'App'; Delegation = 'Microsoft.Web/serverFarms'; Hint = 'app'; Key = 'ExistingAppSubnetId' }
+                @{ Label = 'PostgreSQL'; Delegation = 'Microsoft.DBforPostgreSQL/flexibleServers'; Hint = 'postgres'; Key = 'ExistingPostgresSubnetId' }
+                @{ Label = 'Private endpoint'; Delegation = ''; Hint = 'pl|private'; Key = 'ExistingPrivateEndpointSubnetId' }
+            )
+            $picked = @{}
+            foreach ($role in $subnetRoles) {
+                $candidates = @($allSubnets | Where-Object {
+                    $subnet = $_
+                    $prefix = if ($subnet.prefix) { $subnet.prefix } else { @($subnet.prefixes)[0] }
+                    $delegations = @($subnet.delegations | Where-Object { $_ })
+                    $subnet.id -notin $picked.Values -and
+                    $prefix -and
+                    $(if ($role.Delegation) { ($delegations.Count -eq 0 -or $delegations -contains $role.Delegation) -and [int]$prefix.Split('/')[1] -le 28 } else { $delegations.Count -eq 0 })
+                })
+                if (-not $candidates.Count) {
+                    throw "VNet '$vnetName' has no free subnet that can serve as the $($role.Label) subnet. Create one in the VNet (App and PostgreSQL /28 or larger; private endpoint undelegated) and run setup again."
+                }
+                $default = 1
+                for ($i = 0; $i -lt $candidates.Count; $i++) {
+                    if ($candidates[$i].name -match $role.Hint) { $default = $i + 1; break }
+                }
+                $menu = @($candidates | ForEach-Object {
+                    $prefix = if ($_.prefix) { $_.prefix } else { @($_.prefixes)[0] }
+                    $note = if ($role.Delegation -and -not (@($_.delegations) -contains $role.Delegation)) { 'delegation will be added' } elseif ($role.Delegation) { 'already delegated' } else { 'no delegation' }
+                    @{ Label = ('{0}  {1}  ({2})' -f $_.name, $prefix, $note); Value = $_.id }
+                })
+                $picked[$role.Key] = Select-InstallOption "$($role.Label) subnet in '$vnetName':" $menu $default "Pick the subnet for the $($role.Label) tier. CloudLens uses its existing address range unchanged."
+            }
+            foreach ($role in $subnetRoles) {
+                Set-Variable -Name $role.Key -Value $picked[$role.Key]
+                $existingNetworkOptions[$role.Key] = $picked[$role.Key]
+            }
+            Write-Host "Using VNet '$vnetName' with the subnets selected above." -ForegroundColor Green
+            break
+        }
+    }
     if (-not $NamePrefix -and -not $NameSuffix -and $interactive) {
         $nameMode = Select-InstallOption 'Resource naming mode:' @(
             @{ Label = 'Use generated default names'; Value = 'generated' }
@@ -480,6 +538,7 @@ try {
         }
         $preflightOptions.VnetAddressPrefix = $VnetAddressPrefix
     }
+    foreach ($key in $existingNetworkOptions.Keys) { $preflightOptions[$key] = $existingNetworkOptions[$key] }
     if ($preflightSupportsAppIdentityOnly -and $RuntimeAccessMode -eq 'managed-identity') {
         $preflightOptions.AppIdentityOnly = $true
     }
