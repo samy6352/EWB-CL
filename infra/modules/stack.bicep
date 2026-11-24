@@ -179,6 +179,11 @@ var databaseName = 'cloudlens'
 
 var postgresDnsZoneName = '${postgresName}.private.postgres.database.azure.com'
 var blobDnsZoneName = 'privatelink.blob.${environment().suffixes.storage}'
+var foundryDnsZoneNames = [
+  'privatelink.cognitiveservices.azure.com'
+  'privatelink.openai.azure.com'
+  'privatelink.services.ai.azure.com'
+]
 
 // Role definition IDs are constants across every Azure tenant.
 var storageBlobDataContributor = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
@@ -556,7 +561,11 @@ resource foundry 'Microsoft.CognitiveServices/accounts@2025-04-01-preview' = {
   }
   properties: {
     customSubDomainName: foundryName
-    publicNetworkAccess: 'Enabled'
+    // The isolated shape reaches Foundry only through the private endpoint below.
+    publicNetworkAccess: networkIsolation ? 'Disabled' : 'Enabled'
+    networkAcls: {
+      defaultAction: networkIsolation ? 'Deny' : 'Allow'
+    }
     // Required before a project can be created underneath the account. Azure
     // refuses the project with "Project can only created under AIServices Kind
     // account with allowProjectManagement set to true" without it.
@@ -597,6 +606,70 @@ resource model 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
   // parallel; ARM returns a conflict. The dependency serialises them.
   dependsOn: [
     project
+  ]
+}
+
+// Private Link for Foundry. All three zones are needed: the project endpoint
+// resolves under services.ai.azure.com, the OpenAI surface under openai.azure.com
+// and the shared Cognitive Services surface under cognitiveservices.azure.com.
+// Created after the model so the account is not being updated while a project or
+// deployment is still provisioning, which ARM answers with a conflict.
+resource foundryDnsZones 'Microsoft.Network/privateDnsZones@2024-06-01' = [for zone in foundryDnsZoneNames: if (networkIsolation) {
+  name: zone
+  location: 'global'
+  tags: tags
+}]
+
+resource foundryDnsLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = [for (zone, i) in foundryDnsZoneNames: if (networkIsolation) {
+  parent: foundryDnsZones[i]
+  name: 'link-${vnetName}'
+  location: 'global'
+  properties: {
+    registrationEnabled: false
+    virtualNetwork: {
+      id: vnet.id
+    }
+  }
+}]
+
+resource foundryPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = if (networkIsolation) {
+  name: bracketed ? '${namePrefix}-pe-aif-${nameSuffix}' : 'pe-${namePrefix}-aif'
+  location: location
+  tags: tags
+  properties: {
+    subnet: {
+      id: '${vnet.id}/subnets/snet-privatelink'
+    }
+    privateLinkServiceConnections: [
+      {
+        name: 'foundry'
+        properties: {
+          privateLinkServiceId: foundry.id
+          groupIds: [
+            'account'
+          ]
+        }
+      }
+    ]
+  }
+  dependsOn: [
+    model
+  ]
+}
+
+resource foundryPrivateDnsGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = if (networkIsolation) {
+  parent: foundryPrivateEndpoint
+  name: 'default'
+  properties: {
+    privateDnsZoneConfigs: [for (zone, i) in foundryDnsZoneNames: {
+      name: replace(zone, '.', '-')
+      properties: {
+        privateDnsZoneId: foundryDnsZones[i].id
+      }
+    }]
+  }
+  dependsOn: [
+    foundryDnsLinks
   ]
 }
 
@@ -825,6 +898,48 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
         }
       ]
     }
+  }
+}
+
+// Web server, console, application, audit and platform logs go to the same
+// Log Analytics workspace as Application Insights.
+resource webAppDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  scope: webApp
+  name: 'send-to-log-analytics'
+  properties: {
+    workspaceId: workspace.id
+    logs: [
+      {
+        category: 'AppServiceHTTPLogs'
+        enabled: true
+      }
+      {
+        category: 'AppServiceConsoleLogs'
+        enabled: true
+      }
+      {
+        category: 'AppServiceAppLogs'
+        enabled: true
+      }
+      {
+        category: 'AppServiceAuditLogs'
+        enabled: true
+      }
+      {
+        category: 'AppServiceIPSecAuditLogs'
+        enabled: true
+      }
+      {
+        category: 'AppServicePlatformLogs'
+        enabled: true
+      }
+    ]
+    metrics: [
+      {
+        category: 'AllMetrics'
+        enabled: true
+      }
+    ]
   }
 }
 
