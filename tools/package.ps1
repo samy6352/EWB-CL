@@ -103,13 +103,13 @@ $requiredFiles = @('app/__init__.py', 'app/main.py', 'web/login.html', 'web/asse
 if ($builtUi -or $InstallerSource) { $requiredFiles += 'web/v2/index.html' }
 if ($InstallerSource) {
     $sourceFiles = @(
-        'README.md', 'Cloudlens-Documentation.Md', '.env.example',
+        'README.md', '.env.example',
         'requirements.in', 'requirements-dev.txt', 'pyproject.toml',
         'ingest.py', 'verify_warehouse.py',
         'tools/package.ps1', 'tools/validate_package.py', 'tools/verify_package.py', 'tools/start_local.py',
         'tools/install-customer.ps1',
         'infra/README.md', 'infra/CUSTOMER-DEPLOYMENT.md', 'infra/install.ps1', 'infra/deploy.ps1',
-        'infra/add-subscriptions.ps1',
+        'infra/add-subscriptions.ps1', 'infra/onboard-subscriptions.ps1',
         'infra/preflight.ps1', 'infra/deployment-checks.ps1', 'infra/install-prerequisites.ps1',
         'infra/cost-access.ps1', 'infra/storage-naming.ps1',
         'infra/focus-exports.ps1', 'infra/grant-cost-access.ps1',
