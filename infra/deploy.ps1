@@ -216,6 +216,7 @@ if (-not $NetworkIsolation -and -not [string]::IsNullOrWhiteSpace($existingSubne
     throw 'Existing subnets only apply to the isolated shape; remove them or use -NetworkIsolation $true.'
 }
 if ($NetworkIsolation -and -not $useExistingNetwork) {
+    $network = Get-CloudLensIpv4Range $VnetAddressPrefix
     $subnets = @($AppSubnetAddressPrefix, $PostgresSubnetAddressPrefix, $PrivateEndpointSubnetAddressPrefix)
     foreach ($subnet in $subnets) {
         $range = Get-CloudLensIpv4Range $subnet

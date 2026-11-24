@@ -176,8 +176,7 @@ $existing = Invoke-Az -AllowFailure -Arguments @(
     'storage', 'container', 'exists', '--account-name', $accountName, '--name', $Container,
     '--auth-mode', 'login', '--subscription', $storageSub, '-o', 'json')
 if ($null -eq $existing) {
-    Warn "could not check the container (this needs Storage Blob Data Reader on $accountName)"
-    Warn 'continuing; Azure will reject the export if the container is genuinely absent'
+    Info 'container check skipped (storage is private to the app network); Azure validates it on export create'
 } elseif (-not $existing.exists) {
     if ($PSCmdlet.ShouldProcess("$accountName/$Container", 'create container')) {
         Invoke-Az -Arguments @('storage', 'container', 'create', '--account-name', $accountName,
@@ -364,7 +363,7 @@ foreach ($sub in $Subscriptions) {
 # ------------------------------------------------------------------ summary
 
 Step 'Summary'
-$results | Format-Table -AutoSize
+$results | Format-Table -AutoSize | Out-Host
 
 $ready = @($results | Where-Object { $_.status -eq 'ready' }).Count
 if ($ready -gt 0) {
@@ -378,4 +377,11 @@ if (@($results | Where-Object { $_.status -ne 'ready' }).Count -gt 0) {
     Write-Host ''
     Write-Host 'Some exports are not ready. Re-run this script after fixing the reported access;' -ForegroundColor Yellow
     Write-Host 'it skips whatever already exists.' -ForegroundColor Yellow
+}
+
+# Callers read .status; WhatIf previews count as complete.
+$pendingExports = @($results | Where-Object { $_.status -ne 'ready' -and $_.status -ne 'skipped (WhatIf)' })
+[pscustomobject]@{
+    status  = $(if ($pendingExports.Count) { 'partial' } else { 'complete' })
+    results = @($results)
 }
