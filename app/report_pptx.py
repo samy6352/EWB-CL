@@ -247,6 +247,8 @@ def to_pptx(data: dict[str, Any]) -> bytes:
     day_count = len(days_sorted)
     avg_day = (sum(daily.values()) / day_count) if day_count else (total / max(1, data["days"]))
     peak_day = max(daily, key=daily.get) if daily else None
+    partial_last = bool(days_sorted and data.get("as_of") and days_sorted[-1] == data["as_of"])
+    partial_note = "Latest day is partial and may be incomplete." if partial_last else ""
 
     previous = sum((s["kpis"].get("previous") or 0.0) for s in sections)
     overall_change = ((sum(s["kpis"]["total"] or 0 for s in sections) - previous) / previous * 100
@@ -258,7 +260,8 @@ def to_pptx(data: dict[str, Any]) -> bytes:
             services[item["name"]] = services.get(item["name"], 0.0) + (item["cost"] or 0.0)
     top_service = max(services.items(), key=lambda kv: kv[1]) if services else None
 
-    movers = [s for s in sections if s["kpis"].get("change_pct") is not None and (s["kpis"]["total"] or 0) > 0]
+    movers = [s for s in sections if s["kpis"].get("change_pct") is not None
+              and (s["kpis"]["total"] or 0) >= max(1.0, total * 0.01)]
     risers = sorted(movers, key=lambda s: -s["kpis"]["change_pct"])
     fallers = sorted(movers, key=lambda s: s["kpis"]["change_pct"])
 
@@ -295,6 +298,8 @@ def to_pptx(data: dict[str, Any]) -> bytes:
 
     card(s, 0.6, 2.95, 7.55, 3.85)
     text(s, "Daily spend", 0.85, 3.12, 5, 0.3, 13, True, INK)
+    if partial_note:
+        text(s, partial_note, 4.4, 3.15, 3.6, 0.3, 9.5, False, MUTED, align="r")
     if len(days_sorted) > 1:
         cd = CategoryChartData()
         cd.categories = thin_labels(days_sorted)
@@ -392,6 +397,8 @@ def to_pptx(data: dict[str, Any]) -> bytes:
         trend = section.get("trend") or {}
         if len(trend.get("labels", [])) > 1:
             text(s, "Daily spend", 0.85, 3.02, 5, 0.3, 13, True, INK)
+            if partial_note:
+                text(s, partial_note, 4.4, 3.05, 3.6, 0.3, 9.5, False, MUTED, align="r")
             cd = CategoryChartData()
             cd.categories = thin_labels(trend["labels"])
             cd.add_series(section["label"], trend["values"])
