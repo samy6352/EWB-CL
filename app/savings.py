@@ -772,7 +772,7 @@ async def build(subs: list[str] | None, days: int,
                 issue = (res.get("error") or res.get("errors") or res.get("unavailable")
                          or ("The source returned partial results." if res.get("partial") else None))
                 if issue:
-                    failed[name] = str(issue)[:200]
+                    failed[name] = _issue_text(issue)[:200]
             if name in failed:
                 log.warning("savings: %s unavailable: %s", name, failed[name])
             # Rebuild from raw inputs, never incrementally mutate the previous merge: a late
@@ -801,11 +801,20 @@ async def build(subs: list[str] | None, days: int,
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _issue_text(issue: Any) -> str:
+    """Readable text for a source problem that may arrive as a string, list or dict."""
+    if isinstance(issue, dict):
+        return "; ".join(_issue_text(v) for v in issue.values() if v)
+    if isinstance(issue, (list, tuple, set)):
+        return "; ".join(_issue_text(v) for v in issue if v)
+    return str(issue)
+
+
 def assemble(data: dict[str, Any], failed: dict[str, str], days: int,
              currency: str | None = None, *, took_ms: int = 0) -> dict[str, Any]:
     """Merge any completed subset using the same deterministic precedence as a full scan."""
     source_failures = {
-        name: str(payload.get("error") or payload.get("errors") or "Source scan is incomplete.")[:400]
+        name: _issue_text(payload.get("error") or payload.get("errors") or "Source scan is incomplete.")[:400]
         for name, payload in data.items()
         if isinstance(payload, dict) and (payload.get("error") or payload.get("errors") or payload.get("partial"))
     }
