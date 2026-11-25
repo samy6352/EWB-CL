@@ -60,6 +60,27 @@ function Find-CloudLensPython {
         & $command.Source -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>$null
         if ($LASTEXITCODE -eq 0) { return $command.Source }
     }
+    if (-not $IsWindows) { return }
+    # Not on PATH: try the py launcher, the standard install folders, then a Store-installed python.
+    $candidates = @()
+    $launcher = Get-Command py -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($launcher) {
+        $resolved = & $launcher.Source -3 -c 'import sys; print(sys.executable)' 2>$null
+        if ($LASTEXITCODE -eq 0 -and $resolved) { $candidates += [string]($resolved | Select-Object -First 1) }
+    }
+    foreach ($base in @("$env:LOCALAPPDATA\Programs\Python", $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($base -and (Test-Path -LiteralPath $base)) {
+            $candidates += Get-ChildItem -LiteralPath $base -Directory -Filter 'Python3*' -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending | ForEach-Object { Join-Path $_.FullName 'python.exe' }
+        }
+    }
+    $candidates += Get-Command python, python3 -CommandType Application -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -match '[\\/]Microsoft[\\/]WindowsApps[\\/]python3?\.exe$' } | ForEach-Object Source
+    foreach ($path in $candidates) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $out = & $path -c 'import sys; print("ok" if sys.version_info >= (3, 11) else "old")' 2>$null
+        if ($LASTEXITCODE -eq 0 -and ($out | Select-Object -First 1) -eq 'ok') { return $path }
+    }
 }
 
 function Test-CloudLensNode {
