@@ -8,7 +8,12 @@ function Install-CloudLensWindowsTool {
     Write-Host "Installing $Name with Windows Package Manager..."
     $PSNativeCommandUseErrorActionPreference = $false
     & winget install --id $PackageId --exact --source winget --accept-package-agreements --accept-source-agreements
-    if ($LASTEXITCODE -ne 0) { throw "Windows Package Manager could not install $Name (exit $LASTEXITCODE). $hint" }
+    # -1978335189: no newer version to apply; -1978335135: already installed. Both mean the tool is present.
+    if ($LASTEXITCODE -notin 0, -1978335189, -1978335135) { throw "Windows Package Manager could not install $Name (exit $LASTEXITCODE). $hint" }
+    Update-CloudLensPath
+}
+
+function Update-CloudLensPath {
     $paths = @($env:PATH, [Environment]::GetEnvironmentVariable('Path', 'User'),
         [Environment]::GetEnvironmentVariable('Path', 'Machine'))
     $env:PATH = (($paths -split ';' | Where-Object { $_ } | Select-Object -Unique) -join ';')
@@ -45,6 +50,8 @@ function Connect-CloudLensAzure {
 
 function Find-CloudLensPython {
     $PSNativeCommandUseErrorActionPreference = $false
+    # A Python installed after this shell opened is on the machine PATH but not in this session.
+    Update-CloudLensPath
     foreach ($name in @('python', 'python3')) {
         $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $command) { continue }

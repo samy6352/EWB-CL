@@ -70,3 +70,18 @@ try {{
             assert "Bicep installation failed" in result.stdout
         else:
             assert "No usable Azure CLI session" in result.stdout
+
+
+@pytest.mark.parametrize("code,ok", [(0, True), (-1978335189, True), (-1978335135, True), (1, False)])
+def test_winget_already_installed_exit_codes_are_not_failures(code, ok):
+    helper = str(ROOT / "infra/install-prerequisites.ps1").replace("'", "''")
+    command = rf"""
+. '{helper}'
+function Get-Command {{ param($Name, $CommandType, $ErrorAction) [pscustomobject]@{{ Source = $Name }} }}
+function winget {{ $global:LASTEXITCODE = {code} }}
+try {{ Install-CloudLensWindowsTool 'Python 3.11+' 'Python.Python.3.13' 'https://x' | Out-Null; 'OK' }}
+catch {{ 'FAIL'; exit 1 }}
+"""
+    result = subprocess.run([PWSH, "-NoProfile", "-Command", command],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert (result.returncode == 0) is ok, result.stdout + result.stderr
